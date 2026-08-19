@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import '../services/audio_route_controller.dart';
 import '../services/signaling_service.dart';
 import '../theme.dart';
 
@@ -21,6 +22,8 @@ class _CallScreenState extends State<CallScreen>
     with SingleTickerProviderStateMixin {
   late final SignalingService _service;
   late final AnimationController _pulseController;
+  AudioRouteController? _audioRouteController;
+  AudioRoute _audioRoute = AudioRoute.speaker;
 
   SignalingState _state = SignalingState.idle;
   MediaStream? _remoteStream;
@@ -37,12 +40,19 @@ class _CallScreenState extends State<CallScreen>
       lowerBound: 0.6,
       upperBound: 1.2,
     );
+    if (_isCaller) {
+      _audioRouteController = AudioRouteController()
+        ..onRouteChanged = (route) {
+          if (mounted) setState(() => _audioRoute = route);
+        }..start();
+    }
     _start();
   }
 
   @override
   void dispose() {
     _pulseController.dispose();
+    _audioRouteController?.dispose();
     unawaited(_service.dispose());
     super.dispose();
   }
@@ -65,6 +75,7 @@ class _CallScreenState extends State<CallScreen>
     setState(() => _state = state);
     if (state == SignalingState.connected) {
       _pulseController.repeat(reverse: true);
+      _audioRouteController?.refresh();
     } else {
       _pulseController.reset();
     }
@@ -74,6 +85,39 @@ class _CallScreenState extends State<CallScreen>
     await _service.hangup();
     if (!mounted) return;
     Navigator.of(context).pop();
+  }
+
+  void _toggleAudioRoute() {
+    unawaited(_audioRouteController?.toggle());
+  }
+
+  Widget _audioRouteButton() {
+    final (icon, tooltip, active) = switch (_audioRoute) {
+      AudioRoute.speaker => (Icons.volume_up, 'Speaker aktif', true),
+      AudioRoute.earpiece => (Icons.phone_in_talk, 'Earpiece aktif', false),
+      AudioRoute.headset => (Icons.headset, 'Headset aktif', true),
+    };
+    return Container(
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        boxShadow: active
+            ? [
+                BoxShadow(
+                  color: kSecondaryColor.withValues(alpha: 0.45),
+                  blurRadius: 18,
+                  spreadRadius: 2,
+                ),
+              ]
+            : null,
+      ),
+      child: IconButton(
+        onPressed: _toggleAudioRoute,
+        icon: Icon(icon),
+        color: active ? kSecondaryColor : Colors.white70,
+        tooltip: tooltip,
+        iconSize: 30,
+      ),
+    );
   }
 
   String get _statusLabel {
@@ -174,18 +218,26 @@ class _CallScreenState extends State<CallScreen>
             if (_isCaller)
               Padding(
                 padding: const EdgeInsets.only(bottom: 40),
-                child: FilledButton.icon(
-                  onPressed: _hangup,
-                  icon: const Icon(Icons.call_end),
-                  label: const Text('Akhiri Panggilan'),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: Colors.redAccent,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 32,
-                      vertical: 16,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: _hangup,
+                      icon: const Icon(Icons.call_end),
+                      label: const Text('Akhiri Panggilan'),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.redAccent,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 32,
+                          vertical: 16,
+                        ),
+                      ),
                     ),
-                  ),
+                    const SizedBox(width: 8),
+                    _audioRouteButton(),
+                  ],
                 ),
               ),
           ],
