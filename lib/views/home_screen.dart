@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../theme.dart';
 import 'call_screen.dart';
 
 class HomeScreen extends StatelessWidget {
@@ -48,8 +49,7 @@ class HomeScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Interkom Rumah'),
-        centerTitle: true,
+        title: const Text('MeshTalk'),
       ),
       body: Padding(
         padding: const EdgeInsets.all(24),
@@ -57,12 +57,39 @@ class HomeScreen extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.center,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const Icon(Icons.home_work_rounded, size: 72),
-            const SizedBox(height: 12),
+            Container(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: kSecondaryColor.withValues(alpha: 0.55),
+                    blurRadius: 32,
+                    spreadRadius: 4,
+                  ),
+                ],
+              ),
+              child: Icon(
+                Icons.home_work_rounded,
+                size: 72,
+                color: kSecondaryColor,
+              ),
+            ),
+            const SizedBox(height: 20),
             Text(
               'Pilih Mode Interkom',
               textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.titleLarge,
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                  ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Terhubung langsung dengan rumah melalui MeshTalk',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: Colors.white54,
+                  ),
             ),
             const SizedBox(height: 40),
             FilledButton.icon(
@@ -71,6 +98,8 @@ class HomeScreen extends StatelessWidget {
               label: const Text('Panggil Rumah (Caller Mode)'),
               style: FilledButton.styleFrom(
                 padding: const EdgeInsets.symmetric(vertical: 16),
+                shadowColor: kSecondaryColor.withValues(alpha: 0.6),
+                elevation: 6,
               ),
             ),
             const SizedBox(height: 16),
@@ -80,6 +109,7 @@ class HomeScreen extends StatelessWidget {
               label: const Text('Standby Rumah (Auto-Answer Callee Mode)'),
               style: OutlinedButton.styleFrom(
                 padding: const EdgeInsets.symmetric(vertical: 16),
+                backgroundColor: kPrimaryColor.withValues(alpha: 0.35),
               ),
             ),
           ],

@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../services/signaling_service.dart';
+import '../theme.dart';
 
 enum CallMode { caller, callee }
 
@@ -14,8 +17,10 @@ class CallScreen extends StatefulWidget {
   State<CallScreen> createState() => _CallScreenState();
 }
 
-class _CallScreenState extends State<CallScreen> {
+class _CallScreenState extends State<CallScreen>
+    with SingleTickerProviderStateMixin {
   late final SignalingService _service;
+  late final AnimationController _pulseController;
 
   SignalingState _state = SignalingState.idle;
   MediaStream? _remoteStream;
@@ -26,20 +31,42 @@ class _CallScreenState extends State<CallScreen> {
   void initState() {
     super.initState();
     _service = SignalingService();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+      lowerBound: 0.6,
+      upperBound: 1.2,
+    );
     _start();
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    unawaited(_service.dispose());
+    super.dispose();
   }
 
   Future<void> _start() async {
     if (_isCaller) {
       await _service.startCaller(
         onRemoteStream: (stream) => setState(() => _remoteStream = stream),
-        onStateChanged: (state) => setState(() => _state = state),
+        onStateChanged: _onStateChanged,
       );
     } else {
       await _service.startCallee(
         onRemoteStream: (stream) => setState(() => _remoteStream = stream),
-        onStateChanged: (state) => setState(() => _state = state),
+        onStateChanged: _onStateChanged,
       );
+    }
+  }
+
+  void _onStateChanged(SignalingState state) {
+    setState(() => _state = state);
+    if (state == SignalingState.connected) {
+      _pulseController.repeat(reverse: true);
+    } else {
+      _pulseController.reset();
     }
   }
 
@@ -67,7 +94,7 @@ class _CallScreenState extends State<CallScreen> {
   Color get _statusColor {
     switch (_state) {
       case SignalingState.connected:
-        return Colors.greenAccent;
+        return kSecondaryColor;
       case SignalingState.failed:
         return Colors.redAccent;
       case SignalingState.disconnected:
@@ -81,12 +108,29 @@ class _CallScreenState extends State<CallScreen> {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(
-          _state == SignalingState.connected
-              ? Icons.volume_up_rounded
-              : Icons.sync,
-          color: _statusColor,
-          size: 64,
+        ScaleTransition(
+          scale: _pulseController,
+          child: Container(
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: _state == SignalingState.connected
+                      ? kSecondaryColor.withValues(alpha: 0.5)
+                      : Colors.transparent,
+                  blurRadius: 40,
+                  spreadRadius: 6,
+                ),
+              ],
+            ),
+            child: Icon(
+              _state == SignalingState.connected
+                  ? Icons.volume_up_rounded
+                  : Icons.sync,
+              color: _statusColor,
+              size: 64,
+            ),
+          ),
         ),
         const SizedBox(height: 16),
         Text(
@@ -109,7 +153,7 @@ class _CallScreenState extends State<CallScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: kSurfaceColor,
       body: SafeArea(
         child: Column(
           children: [
@@ -121,7 +165,7 @@ class _CallScreenState extends State<CallScreen> {
                   child: IconButton(
                     onPressed: _hangup,
                     icon: const Icon(Icons.power_settings_new),
-                    color: Colors.white70,
+                    color: kSecondaryColor,
                     tooltip: 'Matikan mode standby',
                   ),
                 ),
