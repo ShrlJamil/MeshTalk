@@ -1,10 +1,12 @@
 import 'dart:async';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import 'hangup_tone_player.dart';
 import 'notice_tone_player.dart';
 
 enum SignalingState {
@@ -63,36 +65,57 @@ class SignalingService {
     };
   }
 
-  /// Audio constraints enabling Google WebRTC voice processing (echo
-  /// cancellation, noise suppression, auto gain control, high-pass filter).
-  /// Both Android and native iOS parse the `mandatory`/`optional` structure
-  /// and skip their defaults when a Map is provided, so every key is set
-  /// explicitly here.
+  /// Audio constraints for WebRTC's software APM (echo cancellation, noise
+  /// suppression, high-pass filter). `autoGainControl` is deliberately OFF:
+  /// `MODE_IN_COMMUNICATION` (see `_configureVoipAudio`) already activates
+  /// each chipset's own hardware voice-processing HAL, and stacking WebRTC's
+  /// software AGC on top of an aggressive hardware AGC (observed on
+  /// Snapdragon/Poco) over-compresses and distorts the vocal signal. The
+  /// legacy/secondary echo-cancellation variants (`googEchoCancellation2`,
+  /// `googDAEchoCancellation`) are dropped for the same reason: they select
+  /// extra proprietary processing paths on top of the standard AEC, which
+  /// only made hardware-dependent behavior less consistent between Qualcomm
+  /// and MediaTek chipsets. `mandatory` alone is exhaustive — Android and
+  /// iOS both skip their constraint defaults once a Map is provided, so no
+  /// `optional` duplication is needed.
   static const Map<String, dynamic> _audioConstraints = {
     'mandatory': {
       'echoCancellation': true,
       'googEchoCancellation': true,
-      'googEchoCancellation2': true,
-      'googDAEchoCancellation': true,
       'noiseSuppression': true,
       'googNoiseSuppression': true,
-      'autoGainControl': true,
-      'googAutoGainControl': true,
+      'autoGainControl': false,
+      'googAutoGainControl': false,
       'googHighpassFilter': true,
       'googTypingNoiseDetection': false,
     },
-    'optional': [
-      {'googNoiseSuppression': true},
-      {'googEchoCancellation': true},
-      {'googAutoGainControl': true},
-      {'googHighpassFilter': true},
-    ],
   };
 
   final DatabaseReference _database;
 
   RTCPeerConnection? _pc;
   MediaStream? _localStream;
+
+  /// Local mic mute state, toggled from the UI's dock. Purely a local
+  /// `track.enabled` flip — never touches signaling, ICE, or the remote
+  /// peer; the remote side simply receives silence while muted.
+  bool _isMicMuted = false;
+  bool get isMicMuted => _isMicMuted;
+
+  /// Toggles the local microphone. Safe to call anytime, including before
+  /// a local stream exists (no-op on the track loop, flag still flips so
+  /// the UI stays consistent and `_ensureLocalAudioEnabled`/a later capture
+  /// won't accidentally un-mute a user's deliberate mute).
+  void toggleMic() {
+    _isMicMuted = !_isMicMuted;
+    final stream = _localStream;
+    if (stream != null) {
+      for (final track in stream.getAudioTracks()) {
+        track.enabled = !_isMicMuted;
+      }
+    }
+    debugPrint('[MeshTalk] mic ${_isMicMuted ? "muted" : "unmuted"}');
+  }
 
   final List<RTCIceCandidate> _remoteCandidates = [];
   bool _isCaller = false;
@@ -118,11 +141,32 @@ class SignalingService {
   Timer? _statsPollTimer;
   final Map<String, String> _lastPairSignatures = {};
 
+  /// Call-duration timer. Started ONLY from the onIceConnectionState handler
+  /// when ICE actually reaches RTCIceConnectionStateConnected — never from a
+  /// UI event, never while merely "connecting". Auto-hangs-up at
+  /// [_maxCallDurationSeconds] as a data/quota guard.
+  Timer? _callTimer;
+  int _elapsedSeconds = 0;
+  static const int _maxCallDurationSeconds = 180;
+
+  /// Notifies the UI once per second while the call timer is running, so it
+  /// can re-read [formattedCallDuration]. Mirrors the existing
+  /// [onStateChanged] callback pattern already used for signaling-state
+  /// exposure — no new state-management primitive is introduced.
+  void Function()? onCallDurationTick;
+
   /// Prevents the connection notice tone from replaying on transient ICE
   /// reconnects within the same session.
   bool _noticeTonePlayed = false;
 
   final NoticeTonePlayer _noticeTonePlayer = NoticeTonePlayer();
+
+  /// Prevents the hangup tone from replaying more than once per session,
+  /// since multiple call-ending signals (ICE Failed, then the resulting
+  /// hangup()/_onCallEndedByRemote() cascade) can fire for the same event.
+  bool _hangupTonePlayed = false;
+
+  final HangupTonePlayer _hangupTonePlayer = HangupTonePlayer();
 
   /// Timestamp (ms) when the Callee entered standby mode. Offers created
   /// before this moment are considered stale and must be ignored.
@@ -136,10 +180,32 @@ class SignalingService {
   /// the Firebase null-offer and the WebRTC ICE disconnection fire together).
   bool _autoResetting = false;
 
+  /// Re-entrancy lock for [cleanupRoom]. Owned and mutated only by
+  /// [cleanupRoom] itself (set true at entry, reset false in `finally`);
+  /// [hangup] only ever reads it to bail out early, never writes it —
+  /// otherwise `hangup() -> cleanupRoom()` would deadlock itself, since
+  /// cleanupRoom()'s own guard would see the flag already true and no-op.
+  /// This is what prevents a mashed/duplicate Hangup button (or a UI hangup
+  /// racing an auto-hangup) from running the full teardown sequence
+  /// concurrently, over and over.
+  bool _isCleaningUp = false;
+
   StreamSubscription<DatabaseEvent>? _offerSub;
   StreamSubscription<DatabaseEvent>? _answerSub;
   StreamSubscription<DatabaseEvent>? _callerCandidatesSub;
   StreamSubscription<DatabaseEvent>? _calleeCandidatesSub;
+
+  /// Proactive network-transition detection (Wi-Fi <-> Cellular <-> none).
+  /// On every real change, forces the Firebase RTDB socket reconnect cycle
+  /// immediately — instead of waiting to discover a zombie socket reactively
+  /// via a publish-offer/answer timeout.
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+  List<ConnectivityResult>? _lastConnectivity;
+
+  /// Real-time visibility into the RTDB SDK's own view of its connection
+  /// health, via Firebase's special `.info/connected` path. Diagnostic-only
+  /// logging — never read for control flow.
+  StreamSubscription<DatabaseEvent>? _connectionInfoSub;
 
   SignalingState _state = SignalingState.idle;
   SignalingState get state => _state;
@@ -232,6 +298,46 @@ class SignalingService {
     _statsPollTimer = null;
   }
 
+  /// Elapsed call duration formatted as `MM:SS`. Only meaningful once the
+  /// timer has actually started (ICE reached Connected); "00:00" otherwise.
+  String get formattedCallDuration {
+    final minutes = (_elapsedSeconds ~/ 60).toString().padLeft(2, '0');
+    final seconds = (_elapsedSeconds % 60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
+
+  /// Starts the 1s call-duration ticker. Idempotent: a second call while
+  /// already running is a no-op, so a repeated ICE "Connected" event (e.g.
+  /// after a brief reconnect within the same session) never spawns a second
+  /// ticking timer.
+  void _startCallTimer() {
+    if (_callTimer != null) return;
+    _elapsedSeconds = 0;
+    onCallDurationTick?.call();
+    _callTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _elapsedSeconds++;
+      onCallDurationTick?.call();
+      if (_elapsedSeconds >= _maxCallDurationSeconds) {
+        debugPrint(
+          '[MeshTalk] call duration reached ${_maxCallDurationSeconds}s cap -> auto hangup',
+        );
+        // Stop the ticker synchronously first so a slow hangup() cannot let
+        // a second tick fire and trigger a duplicate auto-hangup.
+        _callTimer?.cancel();
+        _callTimer = null;
+        unawaited(hangup());
+      }
+    });
+  }
+
+  /// Cancels the call-duration ticker and resets the elapsed count. Safe to
+  /// call anytime, including when no timer is running.
+  void _stopCallTimer() {
+    _callTimer?.cancel();
+    _callTimer = null;
+    _elapsedSeconds = 0;
+  }
+
   /// Diagnostic-only: polls RTCPeerConnection.getStats(), resolves each
   /// candidate-pair report against its local/remote candidate reports, and
   /// logs a pair only when its observed state actually changed since the
@@ -295,6 +401,83 @@ class SignalingService {
 
   DatabaseReference get _roomRef => _database.child(roomPath);
 
+  /// Forces the native Firebase RTDB SDK to tear down and re-establish its
+  /// persistent socket, since that socket has been observed to go "zombie"
+  /// (silently stop acking writes) after a Wi-Fi <-> cellular transition.
+  ///
+  /// `goOnline()` ALONE is not a reconnect: it only undoes a prior
+  /// `goOffline()` call and is a no-op if the SDK still believes it's
+  /// online — which is exactly the zombie-socket case, where the OS-level
+  /// TCP connection is dead but the SDK's internal state hasn't noticed
+  /// yet. The full `goOffline()` -> delay -> `goOnline()` cycle is what
+  /// actually forces a fresh connection; this mirrors the cycle already
+  /// proven to work in `cleanupRoom()`'s own timeout recovery, now shared
+  /// via this single helper.
+  Future<void> _forceSocketReconnect() async {
+    try {
+      await FirebaseDatabase.instance.goOffline();
+      await Future.delayed(const Duration(milliseconds: 300));
+      await FirebaseDatabase.instance.goOnline();
+    } catch (error) {
+      debugPrint('[MeshTalk] forced RTDB reconnect cycle failed (continuing anyway): $error');
+    }
+  }
+
+  /// Hints the SDK to keep this room's data actively synced (rather than
+  /// only while a listener is attached), so the connection has a persistent
+  /// reason to stay warm. Fire-and-forget: this is an optimization, never a
+  /// precondition for the call to proceed.
+  void _keepRoomSynced() {
+    unawaited(
+      _roomRef.keepSynced(true).catchError((Object error) {
+        debugPrint('[MeshTalk] keepSynced(true) failed (non-fatal): $error');
+      }),
+    );
+  }
+
+  /// Starts proactive network-transition detection. Every REAL change in
+  /// connectivity type (the first event after subscribing is just the
+  /// current baseline, not a transition) immediately triggers a forced RTDB
+  /// reconnect cycle — catching a zombie socket at the moment it's created,
+  /// instead of only discovering it reactively via a publish timeout later.
+  void _startConnectivityMonitoring() {
+    _stopConnectivityMonitoring();
+    _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
+      final previous = _lastConnectivity;
+      _lastConnectivity = results;
+      if (previous == null) {
+        debugPrint('[MeshTalk] connectivity baseline: $results');
+        return;
+      }
+      debugPrint(
+        '[MeshTalk] connectivity changed: $previous -> $results -> forcing RTDB reconnect',
+      );
+      unawaited(_forceSocketReconnect());
+    });
+  }
+
+  void _stopConnectivityMonitoring() {
+    _connectivitySub?.cancel();
+    _connectivitySub = null;
+    _lastConnectivity = null;
+  }
+
+  /// Diagnostic-only: logs Firebase's own real-time view of whether the
+  /// RTDB SDK currently has a live connection to the backend, via the
+  /// special `.info/connected` path. Never read for control flow.
+  void _startConnectionInfoLogging() {
+    _stopConnectionInfoLogging();
+    _connectionInfoSub =
+        FirebaseDatabase.instance.ref('.info/connected').onValue.listen((event) {
+      debugPrint('[MeshTalk] Firebase RTDB .info/connected = ${event.snapshot.value}');
+    });
+  }
+
+  void _stopConnectionInfoLogging() {
+    _connectionInfoSub?.cancel();
+    _connectionInfoSub = null;
+  }
+
   Future<RTCPeerConnection> _createPeerConnection() async {
     debugPrint('[MeshTalk] Creating PeerConnection (session=$_sessionId)');
     final pc = await createPeerConnection(_iceConfiguration);
@@ -315,12 +498,36 @@ class SignalingService {
       _pushCandidate(node, candidate.toMap());
     };
 
-    pc.onTrack = (event) {
+    pc.onTrack = (event) async {
       if (session != _sessionId) return;
-      final stream = event.streams.isNotEmpty ? event.streams.first : event.receiver?.track;
-      if (stream is MediaStream) {
-        onRemoteStream?.call(stream);
+
+      debugPrint(
+        '[MeshTalk][TRACK] onTrack event received. Streams length: ${event.streams.length}, '
+        'track kind: ${event.track.kind}, track enabled: ${event.track.enabled}',
+      );
+
+      MediaStream targetStream;
+      if (event.streams.isNotEmpty) {
+        targetStream = event.streams.first;
+      } else {
+        // FIX: the old fallback assigned event.receiver?.track (a
+        // MediaStreamTrack) to a MediaStream? slot, which could never pass
+        // an `is MediaStream` check — onRemoteStream was silently never
+        // called whenever a track arrived with no associated stream. Build
+        // a real MediaStream around the bare track instead of losing it.
+        debugPrint(
+          '[MeshTalk][TRACK] event.streams is empty! Creating fallback MediaStream from event.track.',
+        );
+        final newStream = await createLocalMediaStream('remote_stream_${event.track.id}');
+        await newStream.addTrack(event.track);
+        targetStream = newStream;
       }
+
+      debugPrint(
+        '[MeshTalk][TRACK] Delivering remoteStream to listener. Audio tracks count: '
+        '${targetStream.getAudioTracks().length}',
+      );
+      onRemoteStream?.call(targetStream);
     };
 
     pc.onConnectionState = (state) {
@@ -354,6 +561,7 @@ class SignalingService {
       if (state == RTCIceConnectionState.RTCIceConnectionStateConnected) {
         _onPeerConnected();
         _stopStatsPolling();
+        _startCallTimer();
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateClosed ||
           state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
@@ -364,6 +572,8 @@ class SignalingService {
           unawaited(_pollIceStats(_roleLabel, session, isFinalSnapshot: true));
         }
         _stopStatsPolling();
+        _stopCallTimer();
+        _playHangupToneOnce();
         _handlePeerDisconnected();
       }
     };
@@ -388,6 +598,10 @@ class SignalingService {
       '[MeshTalk] getUserMedia: obtained ${stream.getAudioTracks().length} audio track(s)',
     );
     for (final track in stream.getAudioTracks()) {
+      debugPrint(
+        '[MeshTalk][MIC] Local audio track -> id: ${track.id}, '
+        'enabled: ${track.enabled}, muted: ${track.muted}',
+      );
       await _pc?.addTrack(track, stream);
     }
     return stream;
@@ -429,6 +643,7 @@ class SignalingService {
 
   Future<void> _closePeerConnection() async {
     _stopStatsPolling(); // diagnostic-only cleanup, no effect on ICE/signaling
+    _stopCallTimer();
     debugPrint('[ICE][session=$_sessionId] closing peer connection');
     await _pc?.close();
     _pc = null;
@@ -444,6 +659,8 @@ class SignalingService {
     _handled = false;
     _calleeActiveSinceMillis = null;
     _noticeTonePlayed = false;
+    _hangupTonePlayed = false;
+    _isMicMuted = false;
     _localCandidateCount = 0;
     _remoteReceivedCount = 0;
     _remoteBufferedCount = 0;
@@ -452,11 +669,19 @@ class SignalingService {
     _lastIceConnectionState = null;
     _lastIceGatheringState = null;
     _lastPairSignatures.clear();
+    _stopCallTimer();
+    _stopConnectivityMonitoring();
+    _stopConnectionInfoLogging();
   }
 
   /// Cleans the whole room (Firebase node + local WebRTC state) before
   /// starting a fresh handshake so no stale offer/answer/candidate is reused.
   Future<void> cleanupRoom() async {
+    if (_isCleaningUp) {
+      debugPrint('[ICE][session=$_sessionId] cleanupRoom SKIPPED (already in progress)');
+      return;
+    }
+    _isCleaningUp = true;
     final cleanupSession = _sessionId;
     debugPrint('[ICE][session=$cleanupSession] cleanupRoom START ${_lifecycleSnapshot()}');
     _sessionId++;
@@ -474,12 +699,7 @@ class SignalingService {
         debugPrint(
           '[MeshTalk] Firebase remove timed out (Zombie Connection). Forcing RTDB reconnect...',
         );
-        try {
-          await FirebaseDatabase.instance.goOffline();
-          await FirebaseDatabase.instance.goOnline();
-        } catch (e) {
-          debugPrint('[MeshTalk] Error resetting RTDB connection: $e');
-        }
+        await _forceSocketReconnect();
       } catch (e) {
         debugPrint('[MeshTalk] Error removing room node: $e');
       }
@@ -490,6 +710,8 @@ class SignalingService {
     } catch (error, stackTrace) {
       debugPrint('[ICE][session=$cleanupSession][ERROR] cleanupRoom -> $error\n$stackTrace');
       rethrow;
+    } finally {
+      _isCleaningUp = false;
     }
   }
 
@@ -514,78 +736,99 @@ class SignalingService {
     _isCaller = true;
     _setState(SignalingState.connecting);
     debugPrint('[MeshTalk] startCaller: entered caller mode');
+    _keepRoomSynced();
+    _startConnectivityMonitoring();
+    _startConnectionInfoLogging();
 
     await _traced('CALLER', _sessionId, 'configureVoipAudio', _configureVoipAudio);
     final session = ++_sessionId;
     debugPrint('[MeshTalk] startCaller: session=$session');
 
-    await _traced('CALLER', session, 'createPeerConnection', _createPeerConnection);
-    await _traced('CALLER', session, 'getLocalStream', _getLocalStream);
+    // The whole handshake (PC creation, media capture, SDP, offer publish) is
+    // guarded so a failure at any stage — most notably a slow cellular
+    // socket blowing the publish-offer timeout — is logged, cleanly resets
+    // the session (failed state + timer stop + full cleanupRoom), and never
+    // leaves the UI stuck on "Menghubungi..." with a leaked PeerConnection.
+    try {
+      await _traced('CALLER', session, 'createPeerConnection', _createPeerConnection);
+      await _traced('CALLER', session, 'getLocalStream', _getLocalStream);
 
-    final offer = await _traced(
-      'CALLER',
-      session,
-      'createOffer',
-      () => _pc!.createOffer(),
-    );
-    await _traced(
-      'CALLER',
-      session,
-      'setLocalDescription',
-      () => _pc!.setLocalDescription(offer),
-    );
-    await _traced(
-      'CALLER',
-      session,
-      'publish offer',
-      () => _roomRef.child('offer').set({
-        ...offer.toMap(),
-        'createdAt': DateTime.now().millisecondsSinceEpoch,
-      }).timeout(const Duration(seconds: 4)),
-    );
-
-    // Register the callee candidate listener early so candidates arriving
-    // before the answer is processed are buffered, not lost.
-    _listenCandidates(
-      node: 'callee_candidates',
-      subscription: (sub) => _calleeCandidatesSub = sub,
-    );
-    debugPrint('[CALLER][session=$session] listener callee_candidates installed');
-
-    _answerSub = _roomRef.child('answer').onValue.listen((event) async {
-      if (session != _sessionId) return;
-      if (_remoteDescriptionSet || _pc == null) return;
-
-      final value = event.snapshot.value;
-      if (value == null) return;
-      debugPrint('[MeshTalk] startCaller: answer received (session=$session)');
-      final data = Map<String, dynamic>.from(value as Map);
-      if (data.isEmpty) return;
-
-      final description = RTCSessionDescription(
-        data['sdp'] as String,
-        data['type'] as String,
+      final offer = await _traced(
+        'CALLER',
+        session,
+        'createOffer',
+        () => _pc!.createOffer(),
       );
-      try {
-        await _pc!.setRemoteDescription(description);
-      } catch (error, stackTrace) {
-        debugPrint(
-          '[CALLER][session=$session][ERROR] setRemoteDescription(answer) -> $error\n$stackTrace',
+      await _traced(
+        'CALLER',
+        session,
+        'setLocalDescription',
+        () => _pc!.setLocalDescription(offer),
+      );
+      // Force the native socket awake before the write it's actually needed
+      // for — this is the step observed to be asleep after a cellular
+      // network transition.
+      await _traced('CALLER', session, 'forceSocketReconnect', _forceSocketReconnect);
+      await _traced(
+        'CALLER',
+        session,
+        'publish offer',
+        () => _roomRef.child('offer').set({
+          ...offer.toMap(),
+          'createdAt': DateTime.now().millisecondsSinceEpoch,
+        }).timeout(const Duration(seconds: 10)),
+      );
+
+      // Register the callee candidate listener early so candidates arriving
+      // before the answer is processed are buffered, not lost.
+      _listenCandidates(
+        node: 'callee_candidates',
+        subscription: (sub) => _calleeCandidatesSub = sub,
+      );
+      debugPrint('[CALLER][session=$session] listener callee_candidates installed');
+
+      _answerSub = _roomRef.child('answer').onValue.listen((event) async {
+        if (session != _sessionId) return;
+        if (_remoteDescriptionSet || _pc == null) return;
+
+        final value = event.snapshot.value;
+        if (value == null) return;
+        debugPrint('[MeshTalk] startCaller: answer received (session=$session)');
+        final data = Map<String, dynamic>.from(value as Map);
+        if (data.isEmpty) return;
+
+        final description = RTCSessionDescription(
+          data['sdp'] as String,
+          data['type'] as String,
         );
-        rethrow;
-      }
-      _remoteDescriptionSet = true;
-      debugPrint(
-        '[MeshTalk] startCaller: remoteDescriptionSet, flushing ${_remoteCandidates.length} buffered candidate(s)',
-      );
-      await _flushRemoteCandidates();
-      // Signaling is complete here, but this is NOT a connectivity guarantee.
-      // The only path to SignalingState.connected is pc.onConnectionState
-      // reaching RTCPeerConnectionStateConnected (see _createPeerConnection).
-    });
-    debugPrint('[CALLER][session=$session] listener answer installed');
+        try {
+          await _pc!.setRemoteDescription(description);
+        } catch (error, stackTrace) {
+          debugPrint(
+            '[CALLER][session=$session][ERROR] setRemoteDescription(answer) -> $error\n$stackTrace',
+          );
+          rethrow;
+        }
+        _remoteDescriptionSet = true;
+        debugPrint(
+          '[MeshTalk] startCaller: remoteDescriptionSet, flushing ${_remoteCandidates.length} buffered candidate(s)',
+        );
+        await _flushRemoteCandidates();
+        // Signaling is complete here, but this is NOT a connectivity guarantee.
+        // The only path to SignalingState.connected is pc.onConnectionState
+        // reaching RTCPeerConnectionStateConnected (see _createPeerConnection).
+      });
+      debugPrint('[CALLER][session=$session] listener answer installed');
 
-    debugPrint('[CALLER][session=$session] START COMPLETE ${_lifecycleSnapshot()}');
+      debugPrint('[CALLER][session=$session] START COMPLETE ${_lifecycleSnapshot()}');
+    } catch (error, stackTrace) {
+      debugPrint(
+        '[CALLER][session=$session][ERROR] startCaller handshake failed: $error\n$stackTrace',
+      );
+      _setState(SignalingState.failed);
+      _stopCallTimer();
+      await cleanupRoom();
+    }
   }
 
   Future<void> startCallee({
@@ -609,6 +852,9 @@ class SignalingService {
     _isCaller = false;
     _calleeActiveSinceMillis = DateTime.now().millisecondsSinceEpoch;
     debugPrint('[MeshTalk] startCallee: standby active (activeSince=$_calleeActiveSinceMillis)');
+    _keepRoomSynced();
+    _startConnectivityMonitoring();
+    _startConnectionInfoLogging();
 
     // Note: `setSpeakerphoneOn(true)` is intentionally NOT called here. Doing
     // so at standby pre-activates the AudioSwitch / routes to the speaker
@@ -708,12 +954,17 @@ class SignalingService {
           () => _pc!.setLocalDescription(answer),
         );
 
+        // Force the native socket awake before the write it's actually
+        // needed for — this is the step observed to be asleep after a
+        // cellular network transition.
+        await _traced('CALLEE', session, 'forceSocketReconnect', _forceSocketReconnect);
+
         // Publish the answer, then flush buffered ICE candidates.
         await _traced(
           'CALLEE',
           session,
           'publish answer',
-          () => _roomRef.child('answer').set(answer.toMap()).timeout(const Duration(seconds: 4)),
+          () => _roomRef.child('answer').set(answer.toMap()).timeout(const Duration(seconds: 10)),
         );
         await _traced('CALLEE', session, 'flush candidates', _flushRemoteCandidates);
 
@@ -733,6 +984,7 @@ class SignalingService {
         _handled = false;
         _remoteDescriptionSet = false;
         await _closePeerConnection();
+        _stopCallTimer();
         _setState(SignalingState.failed);
       }
     });
@@ -830,10 +1082,20 @@ class SignalingService {
     debugPrint(
       '[ICE][$_roleLabel][session=$_sessionId] PUSH candidate START type=$type endpoint=$endpoint node=$node',
     );
-    await _roomRef.child(node).push().set(candidate);
-    debugPrint(
-      '[ICE][$_roleLabel][session=$_sessionId] PUSH candidate DONE node=$node',
-    );
+    // Called fire-and-forget from pc.onIceCandidate (never awaited). A
+    // single missed candidate is not fatal to the call — ICE just checks
+    // fewer pairs — so failures here are caught and silently ignored rather
+    // than ever propagating into (and derailing) the main call flow.
+    try {
+      await _roomRef.child(node).push().set(candidate);
+      debugPrint(
+        '[ICE][$_roleLabel][session=$_sessionId] PUSH candidate DONE node=$node',
+      );
+    } catch (error) {
+      debugPrint(
+        '[ICE][$_roleLabel][session=$_sessionId] PUSH candidate ERROR node=$node (ignored): $error',
+      );
+    }
   }
 
   /// Network-level disconnection (ICE or RTCPeerConnection) detected on the
@@ -862,11 +1124,28 @@ class SignalingService {
     );
   }
 
+  /// Plays the one-shot hangup/disconnect tone at most once per session
+  /// (guarded by [_hangupTonePlayed], reset on the next [_resetInternalState]).
+  /// Fire-and-forget with full error isolation, mirroring [_onPeerConnected]:
+  /// a native audio failure must never block or delay cleanupRoom()/
+  /// PeerConnection teardown, and is never awaited by any call-ending path.
+  void _playHangupToneOnce() {
+    if (_hangupTonePlayed) return;
+    _hangupTonePlayed = true;
+    debugPrint('[MeshTalk] call ending -> playing hangup tone');
+    unawaited(
+      _hangupTonePlayer.play().catchError((Object error) {
+        debugPrint('[HANGUP_TONE] playback failed (cleanup continues): $error');
+      }),
+    );
+  }
+
   /// The remote peer ended the call (caller hangup / network drop). Callee
   /// cleans up all resources and automatically re-enters standby mode.
   Future<void> _onCallEndedByRemote() async {
     if (_autoResetting) return;
     _autoResetting = true;
+    _playHangupToneOnce();
     try {
       if (_isCaller) {
         debugPrint('[MeshTalk] remote ended call on caller -> hangup');
@@ -887,7 +1166,12 @@ class SignalingService {
   }
 
   Future<void> hangup() async {
+    if (_isCleaningUp) {
+      debugPrint('[MeshTalk] hangup ignored: cleanup already in progress');
+      return;
+    }
     debugPrint('[MeshTalk] hangup requested');
+    _playHangupToneOnce();
     await cleanupRoom();
     _setState(SignalingState.idle);
   }

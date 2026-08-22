@@ -6,6 +6,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../services/audio_route_controller.dart';
 import '../services/signaling_service.dart';
 import '../theme.dart';
+import '../widgets/liquid_glass.dart';
 
 enum CallMode { caller, callee }
 
@@ -28,12 +29,19 @@ class _CallScreenState extends State<CallScreen>
   SignalingState _state = SignalingState.idle;
   MediaStream? _remoteStream;
 
+  /// Locks the Hangup/Batal button the instant it's tapped, so a slow
+  /// cellular `cleanupRoom()` can never be triggered twice by repeated taps.
+  bool _isEnding = false;
+
   bool get _isCaller => widget.mode == CallMode.caller;
 
   @override
   void initState() {
     super.initState();
-    _service = SignalingService();
+    _service = SignalingService()
+      ..onCallDurationTick = () {
+        if (mounted) setState(() {});
+      };
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1200),
@@ -60,18 +68,36 @@ class _CallScreenState extends State<CallScreen>
   Future<void> _start() async {
     if (_isCaller) {
       await _service.startCaller(
-        onRemoteStream: (stream) => setState(() => _remoteStream = stream),
+        onRemoteStream: _onRemoteStream,
         onStateChanged: _onStateChanged,
       );
     } else {
       await _service.startCallee(
-        onRemoteStream: (stream) => setState(() => _remoteStream = stream),
+        onRemoteStream: _onRemoteStream,
         onStateChanged: _onStateChanged,
       );
     }
   }
 
+  /// Re-attempts the same mode after a failed handshake. Reuses `_start()`
+  /// (and therefore `cleanupRoom()`'s own re-entrancy guard), so this is
+  /// safe even if pressed right as some other cleanup is still settling.
+  Future<void> _retry() async {
+    if (_isEnding || _state != SignalingState.failed) return;
+    setState(() => _state = SignalingState.connecting);
+    await _start();
+  }
+
+  void _onRemoteStream(MediaStream stream) {
+    // The service keeps running in the background after _hangup() pops this
+    // screen (see below), so a late callback landing on a disposed State
+    // must never call setState.
+    if (!mounted) return;
+    setState(() => _remoteStream = stream);
+  }
+
   void _onStateChanged(SignalingState state) {
+    if (!mounted) return;
     setState(() => _state = state);
     if (state == SignalingState.connected) {
       _pulseController.repeat(reverse: true);
@@ -82,42 +108,28 @@ class _CallScreenState extends State<CallScreen>
   }
 
   Future<void> _hangup() async {
-    await _service.hangup();
+    if (_isEnding) return;
+    // Instant feedback: lock the button and drop straight to the idle
+    // visual before anything async happens, so a slow cellular
+    // cleanupRoom() can never be triggered a second time by another tap.
+    setState(() {
+      _isEnding = true;
+      _state = SignalingState.idle;
+    });
+    // Runs in the background — cleanupRoom() keeps going even after this
+    // screen is popped below; SignalingService itself now guards against
+    // re-entrant cleanup, and the callbacks above are mounted-guarded.
+    unawaited(_service.hangup());
     if (!mounted) return;
     Navigator.of(context).pop();
   }
 
-  void _toggleAudioRoute() {
-    unawaited(_audioRouteController?.toggle());
+  void _toggleMic() {
+    setState(() => _service.toggleMic());
   }
 
-  Widget _audioRouteButton() {
-    final (icon, tooltip, active) = switch (_audioRoute) {
-      AudioRoute.speaker => (Icons.volume_up, 'Speaker aktif', true),
-      AudioRoute.earpiece => (Icons.phone_in_talk, 'Earpiece aktif', false),
-      AudioRoute.headset => (Icons.headset, 'Headset aktif', true),
-    };
-    return Container(
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        boxShadow: active
-            ? [
-                BoxShadow(
-                  color: kSecondaryColor.withValues(alpha: 0.45),
-                  blurRadius: 18,
-                  spreadRadius: 2,
-                ),
-              ]
-            : null,
-      ),
-      child: IconButton(
-        onPressed: _toggleAudioRoute,
-        icon: Icon(icon),
-        color: active ? kSecondaryColor : Colors.white70,
-        tooltip: tooltip,
-        iconSize: 30,
-      ),
-    );
+  void _toggleAudioRoute() {
+    unawaited(_audioRouteController?.toggle());
   }
 
   String get _statusLabel {
@@ -135,60 +147,93 @@ class _CallScreenState extends State<CallScreen>
     }
   }
 
-  Color get _statusColor {
+  Color _statusColor(MeshGlassPalette palette) {
     switch (_state) {
       case SignalingState.connected:
-        return kSecondaryColor;
+        return kAccentColor;
       case SignalingState.failed:
-        return Colors.redAccent;
+        return kDangerColor;
       case SignalingState.disconnected:
         return Colors.orangeAccent;
       default:
-        return Colors.white70;
+        return palette.textSecondary;
     }
   }
 
-  Widget _statusIndicator() {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
+  IconData get _statusIcon {
+    if (_state == SignalingState.connected) return Icons.volume_up_rounded;
+    return _isCaller ? Icons.call_rounded : Icons.home_rounded;
+  }
+
+  /// The two large symmetric mode icons. Only the button matching this
+  /// screen's actual mode is ever interactive (as a retry, and only once
+  /// the handshake has failed) — the other is shown dimmed purely so the
+  /// pair reads as a deliberate, balanced pair rather than a missing button.
+  Widget _modeButtonsRow() {
+    final canRetry = _state == SignalingState.failed;
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        ScaleTransition(
-          scale: _pulseController,
-          child: Container(
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              boxShadow: [
-                BoxShadow(
-                  color: _state == SignalingState.connected
-                      ? kSecondaryColor.withValues(alpha: 0.5)
-                      : Colors.transparent,
-                  blurRadius: 40,
-                  spreadRadius: 6,
-                ),
-              ],
-            ),
-            child: Icon(
-              _state == SignalingState.connected
-                  ? Icons.volume_up_rounded
-                  : Icons.sync,
-              color: _statusColor,
-              size: 64,
-            ),
+        Opacity(
+          opacity: _isCaller ? 0.35 : 1,
+          child: GlassCircleButton(
+            icon: Icons.house_rounded,
+            label: 'Standby',
+            tooltip: 'Aktifkan Standby HP Rumah',
+            onPressed: (!_isCaller && canRetry) ? _retry : null,
           ),
         ),
-        const SizedBox(height: 16),
-        Text(
-          _statusLabel,
-          style: TextStyle(
-            color: _statusColor,
-            fontSize: 24,
-            fontWeight: FontWeight.w600,
+        const SizedBox(width: 28),
+        Opacity(
+          opacity: _isCaller ? 1 : 0.35,
+          child: GlassCircleButton(
+            icon: Icons.call_rounded,
+            label: 'Call',
+            tooltip: 'Panggil HP Rumah',
+            onPressed: (_isCaller && canRetry) ? _retry : null,
           ),
         ),
-        const SizedBox(height: 8),
-        Text(
-          _remoteStream != null ? 'Audio tersambung' : 'Interkom Rumah Standby',
-          style: const TextStyle(color: Colors.white54, fontSize: 14),
+      ],
+    );
+  }
+
+  Widget _controlDock(bool isConnected) {
+    final isMuted = _service.isMicMuted;
+    final (audioIcon, audioTooltip) = switch (_audioRoute) {
+      AudioRoute.speaker => (Icons.volume_up_rounded, 'Speaker aktif — ketuk untuk earpiece'),
+      AudioRoute.earpiece => (Icons.phone_in_talk_rounded, 'Earpiece aktif — ketuk untuk speaker'),
+      AudioRoute.headset => (Icons.headset_rounded, 'Headset aktif'),
+    };
+    return GlassDock(
+      children: [
+        GlassDockButton(
+          icon: isMuted ? Icons.mic_off_rounded : Icons.mic_rounded,
+          tooltip: isMuted ? 'Nyalakan mic' : 'Matikan mic',
+          active: isMuted,
+          tint: isMuted ? kDangerColor : null,
+          onPressed: _toggleMic,
+        ),
+        const SizedBox(width: 20),
+        GlassDockButton(
+          icon: Icons.call_end_rounded,
+          tooltip: isConnected
+              ? 'Akhiri panggilan'
+              : (_isCaller ? 'Batalkan panggilan' : 'Matikan mode standby'),
+          diameter: 64,
+          iconSize: 30,
+          tint: kDangerColor,
+          // Locked instantly once tapped — see _hangup().
+          onPressed: _isEnding ? null : _hangup,
+        ),
+        const SizedBox(width: 20),
+        GlassDockButton(
+          icon: audioIcon,
+          tooltip: audioTooltip,
+          active: _audioRoute != AudioRoute.earpiece,
+          // Route switching is caller-only: AudioRouteController is never
+          // started for the Callee (see initState) since its output route
+          // is fixed to speaker right after handshake, not user-toggleable.
+          onPressed: _isCaller ? _toggleAudioRoute : null,
         ),
       ],
     );
@@ -196,52 +241,102 @@ class _CallScreenState extends State<CallScreen>
 
   @override
   Widget build(BuildContext context) {
+    final palette = glassPaletteFor(Theme.of(context).brightness);
+    final statusColor = _statusColor(palette);
+    final isConnected = _state == SignalingState.connected;
+
     return Scaffold(
-      backgroundColor: kSurfaceColor,
-      body: SafeArea(
-        child: Column(
-          children: [
-            if (!_isCaller)
-              Align(
-                alignment: Alignment.topRight,
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: IconButton(
-                    onPressed: _hangup,
-                    icon: const Icon(Icons.power_settings_new),
-                    color: kSecondaryColor,
-                    tooltip: 'Matikan mode standby',
+      backgroundColor: palette.background,
+      body: Stack(
+        children: [
+          const Positioned.fill(child: GlassBackdrop()),
+          SafeArea(
+            child: Column(
+              children: [
+                GlassAppBar(
+                  title: 'MeshTalk',
+                  statusLabel: _statusLabel,
+                  statusColor: statusColor,
+                ),
+                Expanded(
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        ScaleTransition(
+                          scale: _pulseController,
+                          child: Container(
+                            width: 140,
+                            height: 140,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: palette.cardFill,
+                              border: Border.all(color: palette.cardBorder, width: 1.5),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: statusColor.withValues(
+                                    alpha: isConnected ? 0.5 : 0.15,
+                                  ),
+                                  blurRadius: 40,
+                                  spreadRadius: 6,
+                                ),
+                              ],
+                            ),
+                            child: Icon(_statusIcon, size: 56, color: statusColor),
+                          ),
+                        ),
+                        const SizedBox(height: 20),
+                        Text(
+                          _statusLabel,
+                          style: TextStyle(
+                            color: statusColor,
+                            fontSize: 22,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          _remoteStream != null
+                              ? 'Audio tersambung'
+                              : 'Interkom Rumah Standby',
+                          style: TextStyle(color: palette.textSecondary, fontSize: 13),
+                        ),
+                        const SizedBox(height: 28),
+                        if (isConnected)
+                          Text(
+                            _service.formattedCallDuration,
+                            style: TextStyle(
+                              color: palette.textPrimary,
+                              fontSize: 40,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 1,
+                            ),
+                          )
+                        else
+                          _modeButtonsRow(),
+                      ],
+                    ),
                   ),
                 ),
+                // Reserve space so the floating dock never overlaps content
+                // scrolled to the bottom of the Column above.
+                const SizedBox(height: 116),
+              ],
+            ),
+          ),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 24),
+                child: Center(child: _controlDock(isConnected)),
               ),
-            Expanded(child: Center(child: _statusIndicator())),
-            if (_isCaller)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 40),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    FilledButton.icon(
-                      onPressed: _hangup,
-                      icon: const Icon(Icons.call_end),
-                      label: const Text('Akhiri Panggilan'),
-                      style: FilledButton.styleFrom(
-                        backgroundColor: Colors.redAccent,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 32,
-                          vertical: 16,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    _audioRouteButton(),
-                  ],
-                ),
-              ),
-          ],
-        ),
+            ),
+          ),
+        ],
       ),
     );
   }

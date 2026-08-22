@@ -35,11 +35,18 @@ class IntercomApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'MeshTalk',
-      debugShowCheckedModeBanner: false,
-      theme: buildMeshTalkTheme(),
-      home: const HomeScreen(),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeModeNotifier,
+      builder: (context, mode, _) {
+        return MaterialApp(
+          title: 'MeshTalk',
+          debugShowCheckedModeBanner: false,
+          themeMode: mode,
+          theme: buildMeshTalkTheme(Brightness.light),
+          darkTheme: buildMeshTalkTheme(Brightness.dark),
+          home: const HomeScreen(),
+        );
+      },
     );
   }
 }

@@ -13,44 +13,75 @@ private const val NOTICE_TONE_CHANNEL = "meshtalk/notice_tone"
 private const val NOTICE_TONE_ASSET = "assets/sounds/notice.mp3"
 private const val NOTICE_TONE_MAX_DURATION_MS = 5000L
 
+private const val HANGUP_TONE_CHANNEL = "meshtalk/hangup_tone"
+private const val HANGUP_TONE_ASSET = "assets/sounds/hangup_tone.mp3"
+private const val HANGUP_TONE_MAX_DURATION_MS = 2000L
+
 /**
- * Plays the short "connection notice" chime via [SoundPool] instead of the
- * `audioplayers` plugin. SoundPool.play() only mixes decoded PCM into
- * whichever output route/mode WebRTC has already configured; unlike
- * `audioplayers` it never calls AudioManager.setMode(), setSpeakerphoneOn(),
- * or requestAudioFocus(), so it cannot interfere with the active
- * MODE_IN_COMMUNICATION call session.
+ * Plays the short "connection notice" / "call ended" chimes via [SoundPool]
+ * instead of the `audioplayers` plugin. SoundPool.play() only mixes decoded
+ * PCM into whichever output route/mode WebRTC has already configured;
+ * unlike `audioplayers` it never calls AudioManager.setMode(),
+ * setSpeakerphoneOn(), or requestAudioFocus(), so it cannot interfere with
+ * the active MODE_IN_COMMUNICATION call session or its teardown.
+ *
+ * The two tones are fully isolated (separate SoundPool/Handler/state) so
+ * that stopping one can never cut off the other.
  */
 class MainActivity : FlutterActivity() {
-    private var soundPool: SoundPool? = null
-    private val stopHandler = Handler(Looper.getMainLooper())
-    private var pendingStop: Runnable? = null
+    private val noticeTone = SoundPoolTone(NOTICE_TONE_ASSET, NOTICE_TONE_MAX_DURATION_MS)
+    private val hangupTone = SoundPoolTone(HANGUP_TONE_ASSET, HANGUP_TONE_MAX_DURATION_MS)
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, NOTICE_TONE_CHANNEL)
+        registerToneChannel(flutterEngine, NOTICE_TONE_CHANNEL, noticeTone)
+        registerToneChannel(flutterEngine, HANGUP_TONE_CHANNEL, hangupTone)
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        noticeTone.stop()
+        hangupTone.stop()
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+
+    private fun registerToneChannel(
+        flutterEngine: FlutterEngine,
+        channelName: String,
+        tone: SoundPoolTone,
+    ) {
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "play" -> {
-                        playNoticeTone()
+                        tone.play(assets)
                         result.success(null)
                     }
                     "stop" -> {
-                        stopNoticeTone()
+                        tone.stop()
                         result.success(null)
                     }
                     else -> result.notImplemented()
                 }
             }
     }
+}
 
-    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
-        stopNoticeTone()
-        super.cleanUpFlutterEngine(flutterEngine)
-    }
+/**
+ * One isolated, one-shot [SoundPool] player for a single short audio asset.
+ * Every call to [play] tears down and recreates its own player, so two
+ * instances of this class (e.g. notice tone and hangup tone) never share or
+ * contend for state.
+ */
+private class SoundPoolTone(
+    private val assetPath: String,
+    private val maxDurationMs: Long,
+) {
+    private var soundPool: SoundPool? = null
+    private val stopHandler = Handler(Looper.getMainLooper())
+    private var pendingStop: Runnable? = null
 
-    private fun playNoticeTone() {
-        stopNoticeTone()
+    fun play(assets: android.content.res.AssetManager) {
+        stop()
 
         val attributes = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -70,19 +101,19 @@ class MainActivity : FlutterActivity() {
 
         try {
             val assetKey = FlutterInjector.instance().flutterLoader()
-                .getLookupKeyForAsset(NOTICE_TONE_ASSET)
+                .getLookupKeyForAsset(assetPath)
             assets.openFd(assetKey).use { afd -> pool.load(afd, 1) }
         } catch (_: Exception) {
-            stopNoticeTone()
+            stop()
             return
         }
 
-        val stopRunnable = Runnable { stopNoticeTone() }
+        val stopRunnable = Runnable { stop() }
         pendingStop = stopRunnable
-        stopHandler.postDelayed(stopRunnable, NOTICE_TONE_MAX_DURATION_MS)
+        stopHandler.postDelayed(stopRunnable, maxDurationMs)
     }
 
-    private fun stopNoticeTone() {
+    fun stop() {
         pendingStop?.let { stopHandler.removeCallbacks(it) }
         pendingStop = null
         soundPool?.release()
