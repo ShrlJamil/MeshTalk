@@ -48,3 +48,6 @@ AGENTS.md
 CLAUDE.md
 
 android/app/google-services.json
+
+# Secrets (TURN credentials, etc.) — never commit
+.env

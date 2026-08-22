@@ -1,82 +1,42 @@
 import 'dart:async';
 
-import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 /// Plays the short "connection notice" chime (`assets/sounds/notice.mp3`)
-/// once, at full volume, routed through the speakerphone, but truncates it to
-/// the first [maxPlayDuration] seconds. Playback is non-blocking
-/// (fire-and-forget) and the player is disposed automatically as soon as the
-/// tone finishes or the 5-second cap is reached, so no audio resources are
-/// retained.
+/// once, via a native Android `SoundPool` reached through [_channel].
+///
+/// This deliberately bypasses the `audioplayers` package: its Android
+/// implementation (`WrappedPlayer.updateAudioContext`) writes directly to the
+/// global `android.media.AudioManager` (`setMode` / `setSpeakerphoneOn`) on
+/// every playback, regardless of which `AudioContextAndroid` values are
+/// passed. That collides with the WebRTC call's `MODE_IN_COMMUNICATION`
+/// session and can silently break the callee's mic/speaker route (confirmed
+/// on Realme C12). `SoundPool` never touches `AudioManager` mode,
+/// speakerphone state, or audio focus, so playback here can never disturb
+/// the active call. Non-Android platforms are a no-op.
 class NoticeTonePlayer {
-  static const String assetPath = 'sounds/notice.mp3';
+  static const MethodChannel _channel = MethodChannel('meshtalk/notice_tone');
 
-  static const Duration maxPlayDuration = Duration(seconds: 5);
-
-  static final AudioContext _audioContext = AudioContext(
-    android: AudioContextAndroid(
-      isSpeakerphoneOn: true,
-      audioMode: AndroidAudioMode.inCommunication,
-      contentType: AndroidContentType.speech,
-      usageType: AndroidUsageType.voiceCommunication,
-      audioFocus: AndroidAudioFocus.gainTransient,
-    ),
-  );
-
-  AudioPlayer? _player;
-  Timer? _stopTimer;
+  bool get _isAndroid =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   Future<void> play() async {
-    await dispose();
+    if (!_isAndroid) return;
     debugPrint('[MeshTalk] notice tone: starting playback');
-    final player = AudioPlayer();
-    _player = player;
-
-    player.onPlayerComplete.listen((_) => dispose(), onError: _onStreamError);
-    player.onPlayerStateChanged.listen((state) {
-      if (state == PlayerState.completed || state == PlayerState.stopped) {
-        dispose();
-      }
-    }, onError: _onStreamError);
-
     try {
-      await player.play(
-        AssetSource(assetPath),
-        mode: PlayerMode.mediaPlayer,
-        volume: 1.0,
-        ctx: _audioContext,
-      );
-      _stopTimer = Timer(maxPlayDuration, _stop);
-    } catch (_) {
-      await dispose();
+      await _channel.invokeMethod<void>('play');
+    } catch (error) {
+      debugPrint('[MeshTalk] notice tone: play failed (call continues): $error');
     }
-  }
-
-  /// Auto-stops playback once the 5-second cap is reached. The following
-  /// `stopped` state change triggers the dispose handled above.
-  void _stop() {
-    _stopTimer?.cancel();
-    _stopTimer = null;
-    final player = _player;
-    if (player != null) {
-      unawaited(player.stop());
-    }
-  }
-
-  /// Never lets a native audio error propagate into the WebRTC flow.
-  void _onStreamError(Object error, StackTrace stackTrace) {
-    dispose();
   }
 
   Future<void> dispose() async {
-    _stopTimer?.cancel();
-    _stopTimer = null;
-    final player = _player;
-    _player = null;
-    if (player != null) {
-      await player.dispose();
-      debugPrint('[MeshTalk] notice tone: disposed');
+    if (!_isAndroid) return;
+    try {
+      await _channel.invokeMethod<void>('stop');
+    } catch (_) {
+      // Never let a native audio error propagate into the WebRTC flow.
     }
   }
 }
