@@ -162,7 +162,7 @@ class _CallScreenState extends State<CallScreen>
 
   IconData get _statusIcon {
     if (_state == SignalingState.connected) return Icons.volume_up_rounded;
-    return _isCaller ? Icons.call_rounded : Icons.home_rounded;
+    return _isCaller ? Icons.call_rounded : Icons.headset_mic_rounded;
   }
 
   /// The two large symmetric mode icons. Only the button matching this
@@ -177,9 +177,10 @@ class _CallScreenState extends State<CallScreen>
         Opacity(
           opacity: _isCaller ? 0.35 : 1,
           child: GlassCircleButton(
-            icon: Icons.house_rounded,
+            icon: Icons.headset_mic_rounded,
             label: 'Standby',
-            tooltip: 'Aktifkan Standby HP Rumah',
+            tooltip: 'Aktifkan Standby',
+            tint: kStandbyAccentColor,
             onPressed: (!_isCaller && canRetry) ? _retry : null,
           ),
         ),
@@ -189,7 +190,8 @@ class _CallScreenState extends State<CallScreen>
           child: GlassCircleButton(
             icon: Icons.call_rounded,
             label: 'Call',
-            tooltip: 'Panggil HP Rumah',
+            tooltip: 'Mulai Panggilan',
+            tint: kCallAccentColor,
             onPressed: (_isCaller && canRetry) ? _retry : null,
           ),
         ),
@@ -255,8 +257,11 @@ class _CallScreenState extends State<CallScreen>
               children: [
                 GlassAppBar(
                   title: 'MeshTalk',
-                  statusLabel: _statusLabel,
-                  statusColor: statusColor,
+                  center: DynamicLivePill(
+                    state: _state,
+                    formattedDuration: _service.formattedCallDuration,
+                    idleLabel: 'Target',
+                  ),
                 ),
                 Expanded(
                   child: Center(
@@ -296,24 +301,16 @@ class _CallScreenState extends State<CallScreen>
                         ),
                         const SizedBox(height: 6),
                         Text(
-                          _remoteStream != null
-                              ? 'Audio tersambung'
-                              : 'Interkom Rumah Standby',
+                          _remoteStream != null ? 'Audio tersambung' : 'Interkom Standby',
                           style: TextStyle(color: palette.textSecondary, fontSize: 13),
                         ),
                         const SizedBox(height: 28),
-                        if (isConnected)
-                          Text(
-                            _service.formattedCallDuration,
-                            style: TextStyle(
-                              color: palette.textPrimary,
-                              fontSize: 40,
-                              fontWeight: FontWeight.w700,
-                              letterSpacing: 1,
-                            ),
-                          )
-                        else
-                          _modeButtonsRow(),
+                        // Call duration now lives solely in DynamicLivePill
+                        // (in GlassAppBar) — no redundant big timer here.
+                        // Center stage stays focused on the status icon/text
+                        // above once connected; the mode buttons only show
+                        // pre-connection (and as a failed-state retry).
+                        if (!isConnected) _modeButtonsRow(),
                       ],
                     ),
                   ),

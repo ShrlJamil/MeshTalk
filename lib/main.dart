@@ -1,12 +1,17 @@
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'theme.dart';
 import 'views/home_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Required by flutter_foreground_task before any start/stopService call —
+  // sets up the isolate communication port the Standby foreground service
+  // relies on (see ForegroundServiceController).
+  FlutterForegroundTask.initCommunicationPort();
   await dotenv.load();
   _requireTurnCredentials();
   await Firebase.initializeApp();

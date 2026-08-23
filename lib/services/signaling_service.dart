@@ -2,12 +2,15 @@ import 'dart:async';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_database/firebase_database.dart';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import 'foreground_service_controller.dart';
 import 'hangup_tone_player.dart';
 import 'notice_tone_player.dart';
+import 'proximity_screen_controller.dart';
+import 'screen_wake_controller.dart';
 
 enum SignalingState {
   idle,
@@ -17,9 +20,11 @@ enum SignalingState {
   failed,
 }
 
-class SignalingService {
+class SignalingService with WidgetsBindingObserver {
   SignalingService({DatabaseReference? database})
-      : _database = database ?? FirebaseDatabase.instance.ref();
+      : _database = database ?? FirebaseDatabase.instance.ref() {
+    WidgetsBinding.instance.addObserver(this);
+  }
 
   static const String roomPath = 'intercom_rooms/rumah_utama';
 
@@ -168,6 +173,26 @@ class SignalingService {
 
   final HangupTonePlayer _hangupTonePlayer = HangupTonePlayer();
 
+  /// Screen-off-near-ear during an active call. Started only once the call
+  /// is truly connected, stopped the moment it stops being connected.
+  final ProximityScreenController _proximityScreenController =
+      ProximityScreenController();
+
+  /// Keeps the process alive (persistent notification) while the Callee is
+  /// in Standby, so Android/OEM battery management can't silently freeze or
+  /// kill the Firebase RTDB `offer` listener. Started when Standby begins,
+  /// stopped from [cleanupRoom] regardless of role — a no-op stop when it
+  /// was never running (e.g. on the Caller) is harmless.
+  final ForegroundServiceController _foregroundServiceController =
+      ForegroundServiceController();
+
+  /// Forces the physical display panel awake the instant a valid incoming
+  /// offer is accepted on the Callee (see the `_offerSub` listener in
+  /// [startCallee]) — a deep-sleep screen needs more than the existing
+  /// `setShowWhenLocked`/`setTurnScreenOn` window flags, which only take
+  /// effect once the Activity is already resumed.
+  final ScreenWakeController _screenWakeController = ScreenWakeController();
+
   /// Timestamp (ms) when the Callee entered standby mode. Offers created
   /// before this moment are considered stale and must be ignored.
   int? _calleeActiveSinceMillis;
@@ -212,6 +237,19 @@ class SignalingService {
 
   void Function(SignalingState state)? onStateChanged;
   void Function(MediaStream stream)? onRemoteStream;
+
+  /// Reacts to the app returning to the foreground by immediately forcing a
+  /// fresh RTDB socket (see [_forceSocketReconnect]), rather than waiting to
+  /// discover a possibly OS-frozen connection reactively via the next
+  /// publish/candidate-push timeout. Never awaited by the framework, so this
+  /// is necessarily fire-and-forget.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    debugPrint('[MeshTalk] app lifecycle state changed -> $state');
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_forceSocketReconnect());
+    }
+  }
 
   void _setState(SignalingState state) {
     _state = state;
@@ -478,6 +516,18 @@ class SignalingService {
     _connectionInfoSub = null;
   }
 
+  /// Starts screen-off-near-ear. Fire-and-forget: the native side is
+  /// entirely responsible for the actual screen behavior, and a failure
+  /// here (e.g. no proximity sensor on this device) must never affect the
+  /// call itself.
+  void _startProximityMonitoring() {
+    unawaited(_proximityScreenController.start());
+  }
+
+  void _stopProximityMonitoring() {
+    unawaited(_proximityScreenController.stop());
+  }
+
   Future<RTCPeerConnection> _createPeerConnection() async {
     debugPrint('[MeshTalk] Creating PeerConnection (session=$_sessionId)');
     final pc = await createPeerConnection(_iceConfiguration);
@@ -537,13 +587,19 @@ class SignalingService {
       switch (state) {
         case RTCPeerConnectionState.RTCPeerConnectionStateConnected:
           _setState(SignalingState.connected);
+          // Screen-off-near-ear is tied to the same event that's the sole
+          // authority for SignalingState.connected — never to ICE state or
+          // any earlier signaling-complete point.
+          _startProximityMonitoring();
         case RTCPeerConnectionState.RTCPeerConnectionStateFailed:
           _setState(SignalingState.failed);
           _logIceSummary('FAILED');
+          _stopProximityMonitoring();
           _handlePeerDisconnected();
         case RTCPeerConnectionState.RTCPeerConnectionStateDisconnected:
         case RTCPeerConnectionState.RTCPeerConnectionStateClosed:
           _setState(SignalingState.disconnected);
+          _stopProximityMonitoring();
           _handlePeerDisconnected();
         default:
           break;
@@ -598,9 +654,14 @@ class SignalingService {
       '[MeshTalk] getUserMedia: obtained ${stream.getAudioTracks().length} audio track(s)',
     );
     for (final track in stream.getAudioTracks()) {
+      // Explicit, not just relying on getUserMedia's default: a track
+      // created while `_isMicMuted` is stale (e.g. leaked across sessions)
+      // must never come up silently muted, and a track created while the
+      // user has genuinely muted must not come up accidentally live.
+      track.enabled = !_isMicMuted;
       debugPrint(
-        '[MeshTalk][MIC] Local audio track -> id: ${track.id}, '
-        'enabled: ${track.enabled}, muted: ${track.muted}',
+        '[MeshTalk][MIC] ${_roleLabel[0]}${_roleLabel.substring(1).toLowerCase()} '
+        'Local Track -> id: ${track.id}, enabled: ${track.enabled}, muted: ${track.muted}',
       );
       await _pc?.addTrack(track, stream);
     }
@@ -644,12 +705,53 @@ class SignalingService {
   Future<void> _closePeerConnection() async {
     _stopStatsPolling(); // diagnostic-only cleanup, no effect on ICE/signaling
     _stopCallTimer();
+    _stopProximityMonitoring();
     debugPrint('[ICE][session=$_sessionId] closing peer connection');
     await _pc?.close();
     _pc = null;
     debugPrint('[ICE][session=$_sessionId] disposing local stream');
+    final stream = _localStream;
+    if (stream != null) {
+      // Explicit per-track stop() BEFORE the stream itself is disposed: the
+      // native Android plugin's `MediaStream.dispose()` only detaches tracks
+      // from the stream container — it never calls the per-track
+      // `trackDispose()` that actually releases the underlying AudioSource/
+      // mic hardware. Without this loop, every call leaks one more native
+      // audio track for the life of the process, which is why the mic
+      // previously failed on the 2nd/3rd call until the app was killed.
+      for (final track in stream.getTracks()) {
+        try {
+          await track.stop();
+        } catch (error) {
+          debugPrint('[MeshTalk] track.stop() failed (continuing anyway): $error');
+        }
+      }
+    }
     await _localStream?.dispose();
     _localStream = null;
+  }
+
+  /// Reverts the native audio session to its pre-call default: mode back to
+  /// `MODE_NORMAL` (via the package's own `.media` preset, the direct
+  /// counterpart to the `.communication` preset `_configureVoipAudio`
+  /// applies) and speakerphone forced off. `AudioSwitchManager` on the
+  /// native side is a singleton that outlives any single call — it stays
+  /// wherever the last call left it until explicitly told otherwise, which
+  /// is why some OEM builds (HyperOS/MIUI, ColorOS) got stuck in in-call
+  /// volume/routing after Hangup. Safe to call on every teardown path,
+  /// including ones where no call was actually active yet — errors are
+  /// caught and logged, never rethrown, since a failed reset must never
+  /// block cleanup itself.
+  Future<void> _resetAudioSession() async {
+    try {
+      debugPrint('[MeshTalk] resetting audio session -> MODE_NORMAL');
+      await AndroidNativeAudioManagement.setAndroidAudioConfiguration(
+        AndroidAudioConfiguration.media,
+      );
+      await Helper.setSpeakerphoneOn(false);
+    } catch (error) {
+      debugPrint('[MeshTalk] audio session reset failed (continuing anyway): $error');
+    }
   }
 
   void _resetInternalState() {
@@ -672,6 +774,7 @@ class SignalingService {
     _stopCallTimer();
     _stopConnectivityMonitoring();
     _stopConnectionInfoLogging();
+    _stopProximityMonitoring();
   }
 
   /// Cleans the whole room (Firebase node + local WebRTC state) before
@@ -705,6 +808,14 @@ class SignalingService {
       }
 
       await _noticeTonePlayer.dispose();
+      // Stopped unconditionally regardless of role — a no-op when it was
+      // never running (e.g. cleanupRoom() called from the Caller side).
+      await _foregroundServiceController.stop();
+      // Single shared choke-point for hangup, remote disconnect, failed
+      // handshake, and cancel — cleanupRoom() is called from all of them,
+      // so resetting the audio session here covers every one of those
+      // scenarios without needing a separate call at each site.
+      await _resetAudioSession();
       _resetInternalState();
       debugPrint('[ICE][session=$cleanupSession] cleanupRoom COMPLETE');
     } catch (error, stackTrace) {
@@ -850,11 +961,18 @@ class SignalingService {
     }
 
     _isCaller = false;
+    // Explicit on top of _resetInternalState()'s own reset (already run by
+    // the cleanupRoom() call above): a fresh standby session must never
+    // inherit a mute flag from whatever state the previous call ended in.
+    _isMicMuted = false;
     _calleeActiveSinceMillis = DateTime.now().millisecondsSinceEpoch;
     debugPrint('[MeshTalk] startCallee: standby active (activeSince=$_calleeActiveSinceMillis)');
     _keepRoomSynced();
     _startConnectivityMonitoring();
     _startConnectionInfoLogging();
+    // Fire-and-forget: a foreground-service failure (e.g. denied
+    // notification permission) must never block entering Standby itself.
+    unawaited(_foregroundServiceController.start());
 
     // Note: `setSpeakerphoneOn(true)` is intentionally NOT called here. Doing
     // so at standby pre-activates the AudioSwitch / routes to the speaker
@@ -908,6 +1026,10 @@ class SignalingService {
       if (_handled || _pc != null) return;
       _handled = true;
       debugPrint('[CALLEE][session=$session] offer received ${_lifecycleSnapshot()}');
+      // Earliest confirmed-valid-offer point: fire the physical screen
+      // wake-up here, before any WebRTC/SDP work, so the panel is already
+      // lit by the time the call UI renders.
+      unawaited(_screenWakeController.wake());
 
       final offer = RTCSessionDescription(
         data['sdp'] as String,
@@ -1176,5 +1298,8 @@ class SignalingService {
     _setState(SignalingState.idle);
   }
 
-  Future<void> dispose() => hangup();
+  Future<void> dispose() async {
+    WidgetsBinding.instance.removeObserver(this);
+    await hangup();
+  }
 }

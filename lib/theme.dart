@@ -7,6 +7,15 @@ const Color kAccentColor = Color(0xFF01FAFE);
 /// iOS system-red equivalent, reserved for the Hangup control.
 const Color kDangerColor = Color(0xFFFF453A);
 
+/// Semantic accent for the "Call" action, distinct from Standby so the two
+/// large mode buttons read as two different actions rather than one neutral
+/// shape repeated twice — especially important against a bright Light Mode
+/// background, where a single flat accent tends to disappear.
+const Color kCallAccentColor = Color(0xFF10B981); // Emerald green
+
+/// Semantic accent for the "Standby" action.
+const Color kStandbyAccentColor = Color(0xFF6366F1); // Royal indigo
+
 /// App-wide theme mode, toggled from the glass header on either screen.
 /// A plain top-level [ValueNotifier] (rather than a state-management
 /// package) is enough for a single binary Light/Dark switch shared by two
@@ -50,14 +59,14 @@ class MeshGlassPalette {
   );
 
   static const light = MeshGlassPalette(
-    background: Color(0xFFF4F5F9), // soft off-white
+    background: Color(0xFFF8F9FA), // soft off-white / clean slate
     backgroundGlowA: Color(0x1A01FAFE),
     backgroundGlowB: Color(0x14350074),
-    cardFill: Color(0xA6FFFFFF), // Colors.white.withOpacity(0.65)
-    cardBorder: Color(0x1F000000),
+    cardFill: Color(0xBFFFFFFF), // Colors.white.withOpacity(0.75) — ice glass
+    cardBorder: Color(0x14000000), // Colors.black.withOpacity(0.08)
     cardShadow: Color(0x1A1C1C1E), // soft shadow
-    textPrimary: Color(0xFF1C1C1E),
-    textSecondary: Color(0xFF6E6E73),
+    textPrimary: Color(0xFF1E293B), // deep charcoal/slate
+    textSecondary: Color(0xFF64748B), // muted slate
   );
 }
 

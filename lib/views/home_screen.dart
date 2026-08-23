@@ -40,10 +40,37 @@ class HomeScreen extends StatelessWidget {
       return;
     }
 
+    // Standby keeps a Firebase listener alive in the background waiting for
+    // an incoming offer — without a battery-optimization exemption, Android
+    // (and especially MIUI/Realme UI) can freeze that listener within
+    // minutes. `.status` already makes this effectively "ask once": once
+    // granted, every future Standby entry is a no-op check.
+    if (mode == CallMode.callee) {
+      if (!context.mounted) return;
+      await _requestBatteryOptimizationExemption(context);
+    }
+
     if (!context.mounted) return;
     await Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => CallScreen(mode: mode)),
     );
+  }
+
+  Future<void> _requestBatteryOptimizationExemption(BuildContext context) async {
+    final status = await Permission.ignoreBatteryOptimizations.status;
+    if (status.isGranted) return;
+
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Agar panggilan masuk tetap diterima saat layar mati, izinkan '
+          'MeshTalk berjalan tanpa optimasi baterai.',
+        ),
+        duration: Duration(seconds: 4),
+      ),
+    );
+    await Permission.ignoreBatteryOptimizations.request();
   }
 
   @override
@@ -57,11 +84,7 @@ class HomeScreen extends StatelessWidget {
           SafeArea(
             child: Column(
               children: [
-                const GlassAppBar(
-                  title: 'MeshTalk',
-                  statusLabel: 'Siap',
-                  statusColor: kAccentColor,
-                ),
+                const GlassAppBar(title: 'MeshTalk'),
                 Expanded(
                   child: Center(
                     child: Padding(
@@ -80,7 +103,7 @@ class HomeScreen extends StatelessWidget {
                           ),
                           const SizedBox(height: 6),
                           Text(
-                            'Terhubung langsung dengan rumah melalui MeshTalk',
+                            'Panggilan Langsung',
                             textAlign: TextAlign.center,
                             style: TextStyle(color: palette.textSecondary, fontSize: 13),
                           ),
@@ -89,16 +112,18 @@ class HomeScreen extends StatelessWidget {
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
                               GlassCircleButton(
-                                icon: Icons.home_rounded,
+                                icon: Icons.headset_mic_rounded,
                                 label: 'Standby',
-                                tooltip: 'Jadikan HP ini interkom rumah (auto-answer)',
+                                tooltip: 'Aktifkan Standby (Auto-Answer)',
+                                tint: kStandbyAccentColor,
                                 onPressed: () => _enterMode(context, CallMode.callee),
                               ),
                               const SizedBox(width: 32),
                               GlassCircleButton(
                                 icon: Icons.call_rounded,
                                 label: 'Call',
-                                tooltip: 'Panggil rumah dari HP ini',
+                                tooltip: 'Mulai Panggilan',
+                                tint: kCallAccentColor,
                                 onPressed: () => _enterMode(context, CallMode.caller),
                               ),
                             ],
