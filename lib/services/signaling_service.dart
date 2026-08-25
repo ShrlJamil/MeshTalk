@@ -24,6 +24,7 @@ class SignalingService with WidgetsBindingObserver {
   SignalingService({DatabaseReference? database})
       : _database = database ?? FirebaseDatabase.instance.ref() {
     WidgetsBinding.instance.addObserver(this);
+    _foregroundServiceController.onHeartbeat = _handleStandbyHeartbeat;
   }
 
   static const String roomPath = 'intercom_rooms/rumah_utama';
@@ -249,6 +250,18 @@ class SignalingService with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       unawaited(_forceSocketReconnect());
     }
+  }
+
+  /// Fired every 15 minutes (see [ForegroundServiceController]) while the
+  /// Standby foreground service is running — a coarse fallback keep-alive,
+  /// independent of the event-driven `.info/connected` recovery in
+  /// [_startConnectionInfoLogging]. Only forces a reconnect while genuinely
+  /// idle in Standby (`!_isCaller && !_handled`); a no-op during/after an
+  /// active call, same guard as the `.info/connected` handler.
+  void _handleStandbyHeartbeat() {
+    if (_isCaller || _handled) return;
+    debugPrint('[MeshTalk][RECOVERY] Standby heartbeat tick -> refreshing RTDB socket');
+    unawaited(_forceSocketReconnect());
   }
 
   void _setState(SignalingState state) {
@@ -500,14 +513,28 @@ class SignalingService with WidgetsBindingObserver {
     _lastConnectivity = null;
   }
 
-  /// Diagnostic-only: logs Firebase's own real-time view of whether the
-  /// RTDB SDK currently has a live connection to the backend, via the
-  /// special `.info/connected` path. Never read for control flow.
+  /// Logs Firebase's own real-time view of whether the RTDB SDK currently
+  /// has a live connection to the backend, via the special `.info/connected`
+  /// path. Also acts as a recovery trigger: if this flips to `false` while
+  /// the Callee is idle in Standby (no active/handled call), the SDK itself
+  /// has just told us its socket died — force a reconnect cycle immediately
+  /// rather than waiting for a reactive trigger (app resume, connectivity
+  /// change) that a phone left untouched for hours may never generate.
+  /// While a call is in progress (`_handled == true`) this is left as
+  /// logging-only: cycling the RTDB socket mid-handshake/mid-call is
+  /// unnecessary and best avoided.
   void _startConnectionInfoLogging() {
     _stopConnectionInfoLogging();
     _connectionInfoSub =
         FirebaseDatabase.instance.ref('.info/connected').onValue.listen((event) {
-      debugPrint('[MeshTalk] Firebase RTDB .info/connected = ${event.snapshot.value}');
+      final connected = event.snapshot.value;
+      debugPrint('[MeshTalk] Firebase RTDB .info/connected = $connected');
+      if (connected == false && !_isCaller && !_handled) {
+        debugPrint(
+          '[MeshTalk][RECOVERY] Firebase disconnected in Standby! Triggering _forceSocketReconnect()...',
+        );
+        unawaited(_forceSocketReconnect());
+      }
     });
   }
 
