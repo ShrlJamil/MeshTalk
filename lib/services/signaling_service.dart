@@ -1,13 +1,18 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:http/http.dart' as http;
 
 import 'foreground_service_controller.dart';
 import 'hangup_tone_player.dart';
+import 'incoming_call_notification_controller.dart';
 import 'notice_tone_player.dart';
 import 'proximity_screen_controller.dart';
 import 'screen_wake_controller.dart';
@@ -18,6 +23,111 @@ enum SignalingState {
   connected,
   disconnected,
   failed,
+}
+
+/// Top-level background message handler required by firebase_messaging's
+/// isolate entry point: FCM invokes this in a separate background isolate
+/// when a data message arrives while the app is backgrounded or fully
+/// terminated, so it has no access to any running [SignalingService]
+/// instance (or any other app state) — it can only act on the raw
+/// [RemoteMessage] itself. Registered from `main.dart` via
+/// `FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler)`,
+/// per FlutterFire's requirement that this be a public top-level (or
+/// static) function, never a class method or closure.
+///
+/// On an `incoming_call` wake-up (sent by the `worker/index.js` Cloudflare
+/// Worker after the Caller POSTs to it — this client never holds the
+/// privileged FCM-sending credential itself), this is the "doorbell": it
+/// wakes the screen, ensures the Standby foreground service is running,
+/// shows a dedicated incoming-call notification, and forces the (single,
+/// natively-shared) RTDB socket to reconnect immediately — all via fresh,
+/// self-contained instances/static calls, since this isolate cannot reach
+/// into the main isolate's already-running [SignalingService]. Every step
+/// is awaited (unlike the fire-and-forget pattern used elsewhere in this
+/// file) because Android may tear down this background execution context
+/// the moment the returned Future completes.
+///
+/// Phase 3: also writes a diagnostic breadcrumb trace to
+/// `debug/fcm_wakeup` in RTDB (reset fresh by the Worker at the start of
+/// every `/wake` attempt — see `worker/index.js`) so a failed wake-up can
+/// be pinpointed after the fact from the Firebase Console instead of only
+/// from `debugPrint`, which is unobservable without a tethered device.
+/// Every breadcrumb write is time-boxed and best-effort (see
+/// [_writeFcmWakeupBreadcrumb]) — never a dependency of the actual
+/// wake-up steps around it.
+@pragma('vm:entry-point')
+Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  // A background isolate has no prior Flutter/Firebase initialization of
+  // its own — both must be (re-)established before any Firebase plugin call
+  // is safe here.
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  debugPrint('[MeshTalk][FCM] Background message received: ${message.data}');
+
+  if (message.data['type'] != 'incoming_call') return;
+
+  debugPrint(
+    '[MeshTalk][FCM] incoming_call wake-up -> waking screen + Standby service + RTDB socket',
+  );
+
+  // Confirms — independent of anything below — that this isolate actually
+  // got as far as recognizing the incoming_call message. Distinguishes
+  // "FCM sent but never received/handled" from every failure stage after
+  // this point.
+  await _writeFcmWakeupBreadcrumb({
+    'handler_received': true,
+    'handler_received_at': ServerValue.timestamp,
+    'message_type': message.data['type'],
+  });
+
+  // All three of these are fully self-contained/idempotent and already
+  // swallow their own errors internally (see their doc comments) — nothing
+  // here can throw, and each is safe to call from a fresh instance in any
+  // isolate.
+  await ScreenWakeController().wake();
+  await ForegroundServiceController().start();
+  await IncomingCallNotificationController().show();
+
+  await _writeFcmWakeupBreadcrumb({'reconnect_started_at': ServerValue.timestamp});
+
+  // Force the RTDB socket to recover immediately rather than waiting for a
+  // reactive trigger once the app is actually foregrounded again. The bare
+  // goOnline() first is a cheap, immediate nudge; the goOffline->delay->
+  // goOnline cycle after it is what actually guarantees a fresh socket if
+  // the SDK's internal state still (incorrectly) believes it's connected —
+  // see SignalingService._forceSocketReconnect for the same reasoning.
+  try {
+    await FirebaseDatabase.instance.goOnline();
+  } catch (error) {
+    debugPrint('[MeshTalk][FCM] goOnline() failed (continuing anyway): $error');
+  }
+  try {
+    await FirebaseDatabase.instance.goOffline();
+    await Future.delayed(const Duration(milliseconds: 300));
+    await FirebaseDatabase.instance.goOnline();
+  } catch (error) {
+    debugPrint('[MeshTalk][FCM] forced RTDB reconnect cycle failed (continuing anyway): $error');
+  }
+
+  await _writeFcmWakeupBreadcrumb({'reconnect_completed_at': ServerValue.timestamp});
+}
+
+/// Best-effort write to the Phase 3 FCM-delivery breadcrumb trace at
+/// `debug/fcm_wakeup` under [SignalingService.roomPath] — purely
+/// diagnostic, nothing in the app reads these fields to make behavioral
+/// decisions. Never allowed to block or fail the actual wake-up steps
+/// around it: time-boxed so a slow/unreachable RTDB socket can cost at most
+/// a few seconds rather than stall the whole background isolate, and any
+/// failure (including timeout) is swallowed.
+Future<void> _writeFcmWakeupBreadcrumb(Map<String, Object?> patch) async {
+  try {
+    await FirebaseDatabase.instance
+        .ref('${SignalingService.roomPath}/debug/fcm_wakeup')
+        .update(patch)
+        .timeout(const Duration(seconds: 3));
+  } catch (error) {
+    debugPrint('[MeshTalk][FCM] breadcrumb write failed (continuing anyway): $error');
+  }
 }
 
 class SignalingService with WidgetsBindingObserver {
@@ -232,6 +342,11 @@ class SignalingService with WidgetsBindingObserver {
   /// health, via Firebase's special `.info/connected` path. Diagnostic-only
   /// logging — never read for control flow.
   StreamSubscription<DatabaseEvent>? _connectionInfoSub;
+
+  /// Keeps `callee_fcm_token` in RTDB fresh for the lifetime of a Standby
+  /// session — installed by [_registerFcmToken], torn down alongside the
+  /// other Standby-only subscriptions in [_resetInternalState].
+  StreamSubscription<String>? _fcmTokenRefreshSub;
 
   SignalingState _state = SignalingState.idle;
   SignalingState get state => _state;
@@ -452,6 +567,36 @@ class SignalingService with WidgetsBindingObserver {
 
   DatabaseReference get _roomRef => _database.child(roomPath);
 
+  /// `intercom_rooms/rumah_utama/presence` — real-time Callee reachability,
+  /// separate from the call-signaling nodes (`offer`/`answer`/candidates) so
+  /// the Caller side can read it independently of any handshake in
+  /// progress. See [_registerPresence].
+  DatabaseReference get _presenceRef => _roomRef.child('presence');
+
+  /// (Re-)arms the `presence` crash-safety `onDisconnect()` hook on
+  /// whichever RTDB connection is currently live. Firebase's onDisconnect
+  /// queue is tied to the specific socket session it was registered on: a
+  /// deliberate `goOffline()` -> `goOnline()` cycle (used throughout this
+  /// file to force a fresh socket) opens a brand-new connection with
+  /// nothing armed on it, silently disarming this safety net until it's
+  /// re-armed here. Called once at the end of [_registerPresence] (on top
+  /// of that function's own initial arm-before-write) and again after every
+  /// [_forceSocketReconnect] cycle, so the hook survives for the entire
+  /// Standby session rather than only its first 15 minutes. Fully
+  /// self-contained/best-effort: a failure here must never affect the
+  /// call/Standby it's called from.
+  Future<void> _rearmPresenceOnDisconnect() async {
+    try {
+      await _presenceRef.onDisconnect().set({
+        'status': 'offline',
+        'last_seen': ServerValue.timestamp,
+      });
+      debugPrint('[MeshTalk][PRESENCE] onDisconnect re-armed');
+    } catch (error) {
+      debugPrint('[MeshTalk][PRESENCE] onDisconnect re-arm failed (continuing anyway): $error');
+    }
+  }
+
   /// Forces the native Firebase RTDB SDK to tear down and re-establish its
   /// persistent socket, since that socket has been observed to go "zombie"
   /// (silently stop acking writes) after a Wi-Fi <-> cellular transition.
@@ -469,6 +614,17 @@ class SignalingService with WidgetsBindingObserver {
       await FirebaseDatabase.instance.goOffline();
       await Future.delayed(const Duration(milliseconds: 300));
       await FirebaseDatabase.instance.goOnline();
+      // Presence is a Callee-only concept (see _registerPresence, only ever
+      // called from startCallee()) — guarded the same way
+      // _handleStandbyHeartbeat() guards its own reconnect trigger, so a
+      // Caller-side socket cycle (this same helper is shared by both roles,
+      // e.g. startCaller()'s own forceSocketReconnect step) never re-arms an
+      // onDisconnect hook that would misreport the house's presence as
+      // `offline` when it was actually the Caller's own connection that
+      // dropped.
+      if (!_isCaller) {
+        await _rearmPresenceOnDisconnect();
+      }
     } catch (error) {
       debugPrint('[MeshTalk] forced RTDB reconnect cycle failed (continuing anyway): $error');
     }
@@ -541,6 +697,141 @@ class SignalingService with WidgetsBindingObserver {
   void _stopConnectionInfoLogging() {
     _connectionInfoSub?.cancel();
     _connectionInfoSub = null;
+  }
+
+  /// Shortened form of an opaque FCM registration token for logging —
+  /// mirrors the "never log full credentials" discipline already applied to
+  /// the TURN credentials in [_iceConfiguration], even though a device token
+  /// is not itself a secret in the same sense.
+  String _maskToken(String token) {
+    if (token.length <= 12) return '***';
+    return '${token.substring(0, 8)}...${token.substring(token.length - 4)}';
+  }
+
+  /// Registers this Callee's real-time Presence in RTDB (`presence/status`)
+  /// so the Caller side can show whether the house phone is actually
+  /// reachable before dialing. `.onDisconnect()` is armed BEFORE the
+  /// `ready` write, never after — otherwise a socket drop landing in the gap
+  /// between the two calls would leave `ready` stuck in RTDB with no
+  /// cleanup hook behind it.
+  ///
+  /// Phase 1 scope only: this wires the `ready` <-> `offline` transition
+  /// around Standby entry/disconnect. `waking`/`in_call` are reserved
+  /// status values for a later phase and are deliberately not driven from
+  /// here — this task is scoped to leave existing WebRTC/call logic
+  /// untouched.
+  Future<void> _registerPresence() async {
+    try {
+      await _presenceRef.onDisconnect().set({
+        'status': 'offline',
+        'last_seen': ServerValue.timestamp,
+      });
+      await _presenceRef.set({
+        'status': 'ready',
+        'last_seen': ServerValue.timestamp,
+      });
+      debugPrint('[MeshTalk][PRESENCE] status -> ready');
+      // Re-arm once more now that `ready` is confirmed written, on top of
+      // the arm-before-write above — see _rearmPresenceOnDisconnect's doc
+      // comment for why this same arm has to be repeated for the rest of
+      // the Standby session, not just once here.
+      await _rearmPresenceOnDisconnect();
+    } catch (error) {
+      debugPrint('[MeshTalk][PRESENCE] registration failed (continuing anyway): $error');
+    }
+  }
+
+  /// Fetches this device's current FCM registration token and stores it at
+  /// `callee_fcm_token` in RTDB, so a later phase's Cloud Function can
+  /// address a high-priority wake message directly at this device. Also
+  /// keeps it fresh via [FirebaseMessaging.onTokenRefresh] for the rest of
+  /// this Standby session.
+  ///
+  /// Entirely fire-and-forget/best-effort: a failure here (no Google Play
+  /// Services, token fetch error, etc.) must never block or fail entering
+  /// Standby — it only means the external-wake path stays unavailable until
+  /// the next successful attempt.
+  Future<void> _registerFcmToken() async {
+    try {
+      final token = await FirebaseMessaging.instance.getToken();
+      if (token != null) {
+        await _roomRef.child('callee_fcm_token').set(token);
+        debugPrint('[MeshTalk][FCM] token stored: ${_maskToken(token)}');
+      }
+    } catch (error) {
+      debugPrint('[MeshTalk][FCM] getToken/store failed (continuing anyway): $error');
+    }
+
+    await _fcmTokenRefreshSub?.cancel();
+    _fcmTokenRefreshSub = FirebaseMessaging.instance.onTokenRefresh.listen((newToken) {
+      debugPrint('[MeshTalk][FCM] token refreshed: ${_maskToken(newToken)}');
+      unawaited(
+        _roomRef.child('callee_fcm_token').set(newToken).catchError((Object error) {
+          debugPrint('[MeshTalk][FCM] storing refreshed token failed (continuing anyway): $error');
+        }),
+      );
+    });
+  }
+
+  /// URL of the `worker/index.js` Cloudflare Worker's `/wake` route. The
+  /// Worker (not this client) holds the privileged FCM-sending credential —
+  /// see `worker/index.js` for the full rationale. Read from `.env`
+  /// (`WORKER_WAKE_UP_URL`, see `.env.example`) rather than hardcoded, same
+  /// as [_iceConfiguration]'s TURN credentials, so it can differ per
+  /// deployment without a code change. Never logged in full — only whether
+  /// it's configured, mirroring the token-masking discipline used
+  /// elsewhere in this file.
+  static String? get _workerWakeUpUrl => dotenv.env['WORKER_WAKE_UP_URL'];
+
+  /// Caller-side counterpart to [_registerFcmToken]: called once per
+  /// `startCaller()` attempt, right after the `offer` is published. Reads
+  /// the Callee's `callee_fcm_token` from RTDB and POSTs it — along with the
+  /// static room id — to the Cloudflare Worker at [_workerWakeUpUrl], which
+  /// is the only thing that actually sends the FCM "doorbell" (see
+  /// `worker/index.js`). Fully isolated in its own try-catch and never
+  /// awaited by the caller: a missing token, an unreachable Worker, or any
+  /// other failure here must never block or fail the call itself — RTDB
+  /// signaling proceeds exactly as before regardless of this outcome.
+  Future<void> _triggerCalleeWakeUp() async {
+    try {
+      final workerUrl = _workerWakeUpUrl;
+      if (workerUrl == null || workerUrl.isEmpty) {
+        debugPrint(
+          '[MeshTalk][FCM] WORKER_WAKE_UP_URL not set in .env -> external wake-up '
+          'NOT available for this call attempt (see .env.example)',
+        );
+        return;
+      }
+
+      final snapshot = await _roomRef.child('callee_fcm_token').get();
+      final fcmToken = snapshot.value as String?;
+      if (fcmToken == null || fcmToken.isEmpty) {
+        debugPrint(
+          '[MeshTalk][FCM] callee_fcm_token MISSING -> external wake-up NOT available '
+          'for this call attempt (Callee has likely never entered Standby yet)',
+        );
+        return;
+      }
+
+      final response = await http
+          .post(
+            Uri.parse(workerUrl),
+            headers: {'content-type': 'application/json'},
+            body: jsonEncode({'roomId': 'rumah_utama', 'fcmToken': fcmToken}),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        debugPrint('[MeshTalk][FCM] wake-up Worker call succeeded');
+      } else {
+        debugPrint(
+          '[MeshTalk][FCM] wake-up Worker call failed (continuing anyway): '
+          'HTTP ${response.statusCode} ${response.body}',
+        );
+      }
+    } catch (error) {
+      debugPrint('[MeshTalk][FCM] wake-up Worker call failed (continuing anyway): $error');
+    }
   }
 
   /// Starts screen-off-near-ear. Fire-and-forget: the native side is
@@ -802,10 +1093,15 @@ class SignalingService with WidgetsBindingObserver {
     _stopConnectivityMonitoring();
     _stopConnectionInfoLogging();
     _stopProximityMonitoring();
+    _fcmTokenRefreshSub?.cancel();
+    _fcmTokenRefreshSub = null;
   }
 
-  /// Cleans the whole room (Firebase node + local WebRTC state) before
-  /// starting a fresh handshake so no stale offer/answer/candidate is reused.
+  /// Clears the per-call signaling nodes (Firebase + local WebRTC state)
+  /// before starting a fresh handshake so no stale offer/answer/candidate is
+  /// reused. Scoped deliberately: `presence` and `callee_fcm_token` are
+  /// session-level Standby state, not call state, and must survive this —
+  /// see the multi-path update below.
   Future<void> cleanupRoom() async {
     if (_isCleaningUp) {
       debugPrint('[ICE][session=$_sessionId] cleanupRoom SKIPPED (already in progress)');
@@ -822,16 +1118,32 @@ class SignalingService with WidgetsBindingObserver {
       // Logs "closing peer connection" / "disposing local stream" internally.
       await _closePeerConnection();
 
-      debugPrint('[ICE][session=$cleanupSession] cleanupRoom: removing Firebase room');
+      debugPrint(
+        '[ICE][session=$cleanupSession] cleanupRoom: clearing per-call signaling nodes',
+      );
       try {
-        await _roomRef.remove().timeout(const Duration(seconds: 3));
+        // Atomic multi-path update scoped to ONLY the per-call signaling
+        // nodes. Deliberately NEVER touches `presence` or `callee_fcm_token`
+        // — those are session-level Standby state, not call state, and a
+        // blanket `_roomRef.remove()` here was wiping both on every single
+        // call attempt (including the current one, before its own FCM
+        // wake-up trigger could even read the token) and on every hangup,
+        // leaving the Caller's presence badge stuck at "Memeriksa
+        // status..." indefinitely. See the Phase 2.1 audit for the full
+        // failure chain.
+        await _roomRef.update({
+          'offer': null,
+          'answer': null,
+          'caller_candidates': null,
+          'callee_candidates': null,
+        }).timeout(const Duration(seconds: 3));
       } on TimeoutException catch (_) {
         debugPrint(
-          '[MeshTalk] Firebase remove timed out (Zombie Connection). Forcing RTDB reconnect...',
+          '[MeshTalk] Firebase update timed out (Zombie Connection). Forcing RTDB reconnect...',
         );
         await _forceSocketReconnect();
       } catch (e) {
-        debugPrint('[MeshTalk] Error removing room node: $e');
+        debugPrint('[MeshTalk] Error clearing per-call signaling nodes: $e');
       }
 
       await _noticeTonePlayer.dispose();
@@ -916,6 +1228,11 @@ class SignalingService with WidgetsBindingObserver {
           'createdAt': DateTime.now().millisecondsSinceEpoch,
         }).timeout(const Duration(seconds: 10)),
       );
+      // Trigger the external FCM wake-up via the Cloudflare Worker (see
+      // worker/index.js) — the only thing that ever holds the privileged
+      // FCM-sending credential. Fire-and-forget: this must never block or
+      // fail the call, WebRTC signaling below proceeds regardless.
+      unawaited(_triggerCalleeWakeUp());
 
       // Register the callee candidate listener early so candidates arriving
       // before the answer is processed are buffered, not lost.
@@ -1000,6 +1317,11 @@ class SignalingService with WidgetsBindingObserver {
     // Fire-and-forget: a foreground-service failure (e.g. denied
     // notification permission) must never block entering Standby itself.
     unawaited(_foregroundServiceController.start());
+    // Fire-and-forget for the same reason: Presence/FCM-token registration
+    // are both best-effort — a failure in either must never block or fail
+    // entering Standby itself.
+    unawaited(_registerPresence());
+    unawaited(_registerFcmToken());
 
     // Note: `setSpeakerphoneOn(true)` is intentionally NOT called here. Doing
     // so at standby pre-activates the AudioSwitch / routes to the speaker

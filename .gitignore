@@ -51,3 +51,10 @@ android/app/google-services.json
 
 # Secrets (TURN credentials, etc.) — never commit
 .env
+
+# Cloudflare Wrangler local cache — leaks the linked Cloudflare account's
+# email/account id, not part of the Worker's source
+worker/.wrangler/
+
+# KDE/Dolphin desktop folder metadata — local environment cruft, not project
+.directory

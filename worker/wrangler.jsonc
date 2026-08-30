@@ -1,0 +1,9 @@
+{
+  "name": "meshtalk-wake",
+  "main": "index.js",
+  "compatibility_date": "2024-01-01",
+  // Enables `node:crypto` (createSign) so the Worker can produce the RS256
+  // JWT signature needed for the Google OAuth2 service-account flow without
+  // hand-rolling PEM parsing against the Web Crypto API.
+  "compatibility_flags": ["nodejs_compat"]
+}
