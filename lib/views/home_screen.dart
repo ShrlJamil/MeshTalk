@@ -1,6 +1,8 @@
+import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../services/signaling_service.dart';
 import '../theme.dart';
 import '../widgets/liquid_glass.dart';
 import 'call_screen.dart';
@@ -48,6 +50,11 @@ class HomeScreen extends StatelessWidget {
     if (mode == CallMode.callee) {
       if (!context.mounted) return;
       await _requestBatteryOptimizationExemption(context);
+      // On Android 13+, POST_NOTIFICATIONS is a runtime permission — without
+      // it, neither the Standby foreground-service notification nor the
+      // dedicated incoming-call notification (IncomingCallNotificationController)
+      // can actually display. `.request()` is a no-op if already granted.
+      await Permission.notification.request();
     }
 
     if (!context.mounted) return;
@@ -107,7 +114,9 @@ class HomeScreen extends StatelessWidget {
                             textAlign: TextAlign.center,
                             style: TextStyle(color: palette.textSecondary, fontSize: 13),
                           ),
-                          const SizedBox(height: 48),
+                          const SizedBox(height: 16),
+                          const _HousePresenceBadge(),
+                          const SizedBox(height: 32),
                           Row(
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
@@ -138,6 +147,60 @@ class HomeScreen extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Real-time read-only view of the Callee's Presence (see
+/// `SignalingService._registerPresence`) — lets the Caller (Poco) see
+/// whether the house phone is actually reachable before pressing "Call",
+/// instead of only discovering it after dialing. Reads directly from RTDB
+/// rather than through a [SignalingService] instance: [HomeScreen] never
+/// creates one itself (only [CallScreen] does, per mode), and Presence is
+/// meant to be visible before either mode is entered.
+class _HousePresenceBadge extends StatelessWidget {
+  const _HousePresenceBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = glassPaletteFor(Theme.of(context).brightness);
+    return StreamBuilder<DatabaseEvent>(
+      stream: FirebaseDatabase.instance
+          .ref('${SignalingService.roomPath}/presence/status')
+          .onValue,
+      builder: (context, snapshot) {
+        final status = snapshot.data?.snapshot.value as String?;
+        final (color, label) = switch (status) {
+          'ready' => (const Color(0xFF32D74B), 'Rumah: Siap'),
+          'waking' => (Colors.orangeAccent, 'Rumah: Membangunkan...'),
+          'in_call' => (kCallAccentColor, 'Rumah: Sedang Menelepon'),
+          'offline' => (kDangerColor, 'Rumah: Offline'),
+          _ => (palette.textSecondary, 'Rumah: Memeriksa status...'),
+        };
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: color,
+                shape: BoxShape.circle,
+                boxShadow: [BoxShadow(color: color.withValues(alpha: 0.6), blurRadius: 6)],
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              label,
+              style: TextStyle(
+                color: palette.textSecondary,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }
