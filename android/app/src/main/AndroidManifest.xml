@@ -21,6 +21,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- Required (Android 13+) to post the Standby service notification and
+         the dedicated incoming-call notification (see
+         IncomingCallNotificationController). Already merged in transitively
+         from firebase_messaging/flutter_foreground_task, declared here
+         explicitly too since the app now posts a notification directly. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:label="MeshTalk"
         android:name="${applicationName}"
