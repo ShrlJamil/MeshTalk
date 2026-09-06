@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
@@ -20,6 +21,11 @@ Future<void> main() async {
   await dotenv.load();
   _requireTurnCredentials();
   await Firebase.initializeApp();
+  // Every RTDB read/write in this app (signaling room, presence, FCM token
+  // registration, wake-up breadcrumbs) requires `request.auth != null`, so
+  // this must complete — success or failure — before SignalingService or
+  // any other Firebase-touching service is constructed below/in HomeScreen.
+  await _initFirebaseAuth();
   // Creates the dedicated `meshtalk_incoming_call` notification channel up
   // front. Channel creation is idempotent, and IncomingCallNotificationController
   // also re-ensures it defensively before showing a notification (a
@@ -36,6 +42,20 @@ Future<void> main() async {
   // registered from here.
   FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
   runApp(const IntercomApp());
+}
+
+/// Signs in anonymously so every subsequent RTDB call in the app carries
+/// `request.auth != null`. Never throws: a first-launch-while-offline device
+/// has no way to reach Firebase Auth yet, and the app must still be usable
+/// locally (and retry auth reactively once connectivity returns) rather than
+/// crash at startup.
+Future<void> _initFirebaseAuth() async {
+  try {
+    final userCredential = await FirebaseAuth.instance.signInAnonymously();
+    debugPrint('[MeshTalk][Auth] Signed in anonymously: uid=${userCredential.user?.uid}');
+  } catch (error) {
+    debugPrint('[MeshTalk][Auth] signInAnonymously failed (continuing offline/cached): $error');
+  }
 }
 
 /// Fails fast at startup — before any screen is shown and long before
