@@ -11,6 +11,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
 
 import 'announcement_service.dart';
+import 'callee_status_service.dart';
 import 'foreground_service_controller.dart';
 import 'hangup_tone_player.dart';
 import 'incoming_call_notification_controller.dart';
@@ -176,6 +177,36 @@ Future<bool> publishAnnouncement(String text) async {
     return true;
   } catch (error) {
     debugPrint('[Announcement] send failed (call unaffected): $error');
+    return false;
+  }
+}
+
+/// Phase 3 (on-demand) — asks the House phone for a fresh status snapshot by
+/// writing ONE `callee_status_request` node. No live [SignalingService] /
+/// call needed (HomeScreen never builds one), so this is a top-level helper
+/// like [publishAnnouncement].
+///
+/// A standby Callee's `callee_status_request` listener (see
+/// `SignalingService._handleStatusRequestEvent`) picks it up, reads the
+/// device status once, and writes `callee_status` — which the Caller is
+/// already listening to. This writes nothing on a rebuild and starts no
+/// timer: the Caller UI must call it only on an explicit Refresh tap, and is
+/// responsible for its own debounce (disable-while-pending). Returns `true`
+/// iff the request write succeeded.
+Future<bool> requestCalleeStatus() async {
+  final roomRef = FirebaseDatabase.instance.ref(SignalingService.roomPath);
+  final id = roomRef.child('callee_status_request').push().key ??
+      DateTime.now().microsecondsSinceEpoch.toString();
+  debugPrint('[CalleeStatus][request] sending id=$id');
+  try {
+    await roomRef.child('callee_status_request').set({
+      'id': id,
+      'createdAt': ServerValue.timestamp,
+    }).timeout(const Duration(seconds: 10));
+    debugPrint('[CalleeStatus][request] sent id=$id');
+    return true;
+  } catch (error) {
+    debugPrint('[CalleeStatus][request] send failed: $error');
     return false;
   }
 }
@@ -561,6 +592,29 @@ class SignalingService with WidgetsBindingObserver {
   final ProximityScreenController _proximityScreenController =
       ProximityScreenController();
 
+  /// Phase 3 (on-demand) — reads the House phone's battery / charging /
+  /// network / battery-temperature snapshot and writes it ONCE to the
+  /// isolated `callee_status` RTDB node, only when the Caller explicitly
+  /// asks via the `callee_status_request` node (see [_handleStatusRequestEvent]).
+  /// NO periodic timer, no background work while in standby. Fully
+  /// best-effort: never blocks standby, the heartbeat, the foreground
+  /// service, presence, or a call. See [CalleeStatusService].
+  final CalleeStatusService _calleeStatusService = CalleeStatusService();
+
+  /// `id` of the last `callee_status_request` this Callee actually acted on.
+  /// RTDB `onValue` can re-deliver the same request (socket reconnect,
+  /// listener re-attach) — a request whose `id` matches this is ignored, so
+  /// the device status is never read twice for one request. Reset per
+  /// session by [_resetInternalState].
+  String? _lastHandledStatusRequestId;
+
+  /// True while a status request is mid-flight (native read + RTDB write).
+  /// A second request arriving in that window is dropped rather than
+  /// triggering a concurrent [DeviceStatusReader] pass — the in-flight read
+  /// publishes a fresh snapshot that satisfies every waiting Caller anyway
+  /// ("latest request wins", no queue).
+  bool _handlingStatusRequest = false;
+
   /// Keeps the process alive (persistent notification) while the Callee is
   /// in Standby, so Android/OEM battery management can't silently freeze or
   /// kill the Firebase RTDB `offer` listener. Started when Standby begins,
@@ -606,6 +660,12 @@ class SignalingService with WidgetsBindingObserver {
   /// Callee-side listener for the shared `announcement` node. Installed in
   /// [startCallee] alongside `_offerSub`, torn down in [_cancelSubscriptions].
   StreamSubscription<DatabaseEvent>? _announcementSub;
+
+  /// Callee-side listener for the `callee_status_request` node (Phase 3
+  /// on-demand). Installed in [startCallee] alongside `_offerSub`, torn down
+  /// in [_cancelSubscriptions]. Each valid new request triggers exactly one
+  /// [CalleeStatusService.readAndPublish]; see [_handleStatusRequestEvent].
+  StreamSubscription<DatabaseEvent>? _statusRequestSub;
 
   /// Proactive network-transition detection (Wi-Fi <-> Cellular <-> none).
   /// On every real change, forces the Firebase RTDB socket reconnect cycle
@@ -1295,11 +1355,13 @@ class SignalingService with WidgetsBindingObserver {
     await _callerCandidatesSub?.cancel();
     await _calleeCandidatesSub?.cancel();
     await _announcementSub?.cancel();
+    await _statusRequestSub?.cancel();
     _offerSub = null;
     _answerSub = null;
     _callerCandidatesSub = null;
     _calleeCandidatesSub = null;
     _announcementSub = null;
+    _statusRequestSub = null;
   }
 
   Future<void> _closePeerConnection() async {
@@ -1377,6 +1439,12 @@ class SignalingService with WidgetsBindingObserver {
     _stopProximityMonitoring();
     _fcmTokenRefreshSub?.cancel();
     _fcmTokenRefreshSub = null;
+    // Phase 3 (on-demand): forget the last handled status request so a new
+    // session starts clean. The `callee_status` snapshot node itself is NOT
+    // deleted here — the last known values survive a call, and the Caller
+    // decides freshness from `updatedAt`.
+    _lastHandledStatusRequestId = null;
+    _handlingStatusRequest = false;
     // Announcement (Phase 1): drop any queued/in-flight announcement so it
     // can never leak into the next session, and halt native playback.
     _announcementQueue.clear();
@@ -1642,6 +1710,16 @@ class SignalingService with WidgetsBindingObserver {
     });
     debugPrint('[CALLEE][session=$session] listener announcement installed');
 
+    // Phase 3 (on-demand): the Caller writes `callee_status_request` when it
+    // taps Refresh. Session-guarded here; id de-dupe + stale-timestamp +
+    // active-call guards live in [_handleStatusRequestEvent].
+    _statusRequestSub =
+        _roomRef.child('callee_status_request').onValue.listen((event) {
+      if (session != _sessionId) return;
+      _handleStatusRequestEvent(event, session);
+    });
+    debugPrint('[CALLEE][session=$session] listener callee_status_request installed');
+
     _offerSub = _roomRef.child('offer').onValue.listen((event) async {
       if (session != _sessionId) return;
 
@@ -1862,6 +1940,86 @@ class SignalingService with WidgetsBindingObserver {
     } finally {
       _announcementPlaying = false;
     }
+  }
+
+  /// Callee-side handler for the `callee_status_request` node (Phase 3
+  /// on-demand). Applies the SAME guard family the `offer`/`announcement`
+  /// listeners use, then reads the device status exactly once and writes it
+  /// to `callee_status`:
+  ///
+  ///  - session guard: a request left in RTDB by a previous standby session
+  ///    (Call A) must not trigger a response in session B — `session !=
+  ///    _sessionId` bails out (checked by the caller and again here).
+  ///  - stale-timestamp guard: identical rule to the `offer` listener — a
+  ///    request `createdAt` before this Callee's current `activeSince` is
+  ///    old and ignored.
+  ///  - id de-dupe: `onValue` re-fires (reconnect / re-attach) deliver the
+  ///    same request again; a request whose `id` matches
+  ///    [_lastHandledStatusRequestId] is ignored, so the hardware is never
+  ///    read twice for one request.
+  ///  - in-flight guard: a second request while one is being served is
+  ///    dropped (no concurrent [DeviceStatusReader] pass, no queue).
+  ///  - active-call guard: while a call is up (`_handled`) the request is
+  ///    marked handled and ignored — the telemetry reader is never run just
+  ///    for the status card mid-call. The Caller re-taps Refresh afterwards.
+  ///
+  /// Every failure path is swallowed; a status request must never disturb the
+  /// call, standby, presence, the heartbeat, or the foreground service.
+  void _handleStatusRequestEvent(DatabaseEvent event, int session) {
+    if (session != _sessionId) return;
+
+    final value = event.snapshot.value;
+    if (value is! Map) return;
+    final data = Map<String, dynamic>.from(value);
+
+    final id = data['id']?.toString();
+    final createdAt = int.tryParse(data['createdAt']?.toString() ?? '');
+    if (id == null || id.isEmpty) {
+      debugPrint('[CalleeStatus][request] ignored: missing id');
+      return;
+    }
+
+    if (id == _lastHandledStatusRequestId) {
+      debugPrint('[CalleeStatus][request] ignored id=$id (already handled)');
+      return;
+    }
+
+    // Stale request from a previous session (same rule as the offer listener).
+    final activeSince = _calleeActiveSinceMillis;
+    if (createdAt == null || activeSince == null || createdAt < activeSince) {
+      debugPrint(
+        '[CalleeStatus][request] ignored id=$id as stale '
+        '(createdAt=$createdAt activeSince=$activeSince)',
+      );
+      return;
+    }
+
+    if (_handled) {
+      // Active call: do not run the telemetry reader. Mark handled so a
+      // reconnect re-fire of this same request does not re-evaluate; the
+      // Caller must send a fresh request after the call.
+      _lastHandledStatusRequestId = id;
+      debugPrint('[CalleeStatus][request] ignored id=$id (call active)');
+      return;
+    }
+
+    if (_handlingStatusRequest) {
+      debugPrint('[CalleeStatus][request] dropped id=$id (another in flight)');
+      return;
+    }
+
+    _lastHandledStatusRequestId = id;
+    _handlingStatusRequest = true;
+    debugPrint('[CalleeStatus][request] serving id=$id');
+    unawaited(() async {
+      try {
+        await _calleeStatusService.readAndPublish(requestId: id);
+      } catch (error) {
+        debugPrint('[CalleeStatus][request] readAndPublish threw (ignored): $error');
+      } finally {
+        _handlingStatusRequest = false;
+      }
+    }());
   }
 
   void _listenCandidates({

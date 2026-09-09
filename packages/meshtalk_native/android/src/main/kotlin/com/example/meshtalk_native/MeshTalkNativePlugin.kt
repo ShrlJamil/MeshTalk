@@ -9,6 +9,15 @@ private const val MESSAGE_RINGTONE_CHANNEL = "meshtalk/message_ringtone"
 private const val MESSAGE_RINGTONE_ASSET = "assets/sounds/message_ringtone.mp3"
 
 /**
+ * Phase 3 "Callee status": a single synchronous, read-only device snapshot
+ * (battery / charging / battery-temperature / network quality). Registered
+ * on the same engines as the TTS/ringtone channels so the Callee can publish
+ * its status from the main isolate; see [DeviceStatusReader] for the
+ * no-permission, no-BroadcastReceiver, no-audio-contact guarantees.
+ */
+private const val DEVICE_STATUS_CHANNEL = "meshtalk/device_status"
+
+/**
  * Registers the native Text-to-Speech ([TtsSpeaker]) and message-ringtone
  * ([MessageRingtonePlayer]) MethodChannels on EVERY [io.flutter.embedding.engine.FlutterEngine]
  * the app creates:
@@ -28,11 +37,13 @@ class MeshTalkNativePlugin : FlutterPlugin {
 
     private var ttsChannel: MethodChannel? = null
     private var ringtoneChannel: MethodChannel? = null
+    private var deviceStatusChannel: MethodChannel? = null
     private var ttsSpeaker: TtsSpeaker? = null
     private var messageRingtone: MessageRingtonePlayer? = null
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         val assets: AssetManager = binding.applicationContext.assets
+        val appContext = binding.applicationContext
 
         val speaker = TtsSpeaker(binding.applicationContext)
         ttsSpeaker = speaker
@@ -67,13 +78,26 @@ class MeshTalkNativePlugin : FlutterPlugin {
                 }
             }
         }
+
+        deviceStatusChannel = MethodChannel(binding.binaryMessenger, DEVICE_STATUS_CHANNEL).apply {
+            setMethodCallHandler { call, result ->
+                when (call.method) {
+                    // Synchronous, read-only, fail-safe (see DeviceStatusReader):
+                    // always returns a Map, never throws.
+                    "getDeviceStatus" -> result.success(DeviceStatusReader.read(appContext))
+                    else -> result.notImplemented()
+                }
+            }
+        }
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         ttsChannel?.setMethodCallHandler(null)
         ringtoneChannel?.setMethodCallHandler(null)
+        deviceStatusChannel?.setMethodCallHandler(null)
         ttsChannel = null
         ringtoneChannel = null
+        deviceStatusChannel = null
         try {
             ttsSpeaker?.shutdown()
         } catch (_: Exception) {
