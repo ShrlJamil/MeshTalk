@@ -1,0 +1,26 @@
+name: meshtalk_native
+description: >-
+  Local (path) plugin that registers MeshTalk's native Text-to-Speech
+  (TtsSpeaker) and message-ringtone (MessageRingtonePlayer) MethodChannels on
+  EVERY FlutterEngine the app creates — including the headless engine that
+  firebase_messaging spins up for onBackgroundMessage — so the Phase 1
+  announcement pipeline also works while the Callee is in standby / background
+  / Doze. No Dart API: callers keep using the app's existing
+  AnnouncementService / MessageRingtonePlayer wrappers.
+version: 0.0.1
+publish_to: "none"
+
+environment:
+  sdk: ^3.12.2
+  flutter: ">=3.44.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.example.meshtalk_native
+        pluginClass: MeshTalkNativePlugin

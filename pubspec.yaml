@@ -46,6 +46,14 @@ dependencies:
   http: ^1.5.0
   flutter_local_notifications: ^19.5.0
   firebase_auth: ^6.6.1
+
+  # Local (path) plugin — see packages/meshtalk_native. Exposes the native
+  # TtsSpeaker / MessageRingtonePlayer MethodChannels on every FlutterEngine,
+  # including the headless firebase_messaging background isolate, so the
+  # announcement pipeline works while the Callee is in standby/background/Doze
+  # (Phase 2). Not a third-party dependency: first-party code in this repo.
+  meshtalk_native:
+    path: packages/meshtalk_native
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -72,6 +80,7 @@ flutter:
   assets:
     - assets/sounds/notice.mp3
     - assets/sounds/hangup_tone.mp3
+    - assets/sounds/message_ringtone.mp3
     - .env
 
   # To add assets to your application, add an assets section, like this:

@@ -63,6 +63,51 @@ class HomeScreen extends StatelessWidget {
     );
   }
 
+  /// Phase 2: lets the Caller broadcast a spoken announcement to the house
+  /// WITHOUT starting a call. Just an RTDB write + Worker standby-wake (see
+  /// [publishAnnouncement]) — no mic permission, no WebRTC, no CallScreen.
+  Future<void> _promptAnnouncement(BuildContext context) async {
+    final controller = TextEditingController();
+    final text = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Umumkan ke Rumah'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: SignalingService.maxAnnouncementLength,
+          minLines: 1,
+          maxLines: 3,
+          textInputAction: TextInputAction.send,
+          decoration: const InputDecoration(
+            hintText: 'Contoh: Tolong buka pintu depan',
+          ),
+          onSubmitted: (value) => Navigator.of(dialogContext).pop(value),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Batal'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(controller.text),
+            child: const Text('Kirim'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    final trimmed = text?.trim() ?? '';
+    if (trimmed.isEmpty || !context.mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = await publishAnnouncement(trimmed);
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(ok ? 'Pengumuman terkirim' : 'Gagal mengirim pengumuman'),
+      ),
+    );
+  }
+
   Future<void> _requestBatteryOptimizationExemption(BuildContext context) async {
     final status = await Permission.ignoreBatteryOptimizations.status;
     if (status.isGranted) return;
@@ -136,6 +181,15 @@ class HomeScreen extends StatelessWidget {
                                 onPressed: () => _enterMode(context, CallMode.caller),
                               ),
                             ],
+                          ),
+                          const SizedBox(height: 20),
+                          TextButton.icon(
+                            onPressed: () => _promptAnnouncement(context),
+                            icon: const Icon(Icons.campaign_rounded, size: 18),
+                            label: const Text('Umumkan ke Rumah'),
+                            style: TextButton.styleFrom(
+                              foregroundColor: palette.textSecondary,
+                            ),
                           ),
                         ],
                       ),

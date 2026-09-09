@@ -76,5 +76,11 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- Announcement TTS: lets the app resolve/bind the device
+             Text-to-Speech engine. Required for TTS engine discovery under
+             package-visibility filtering on targetSdk >= 30. -->
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE"/>
+        </intent>
     </queries>
 </manifest>

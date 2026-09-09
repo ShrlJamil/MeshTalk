@@ -10,9 +10,11 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
 
+import 'announcement_service.dart';
 import 'foreground_service_controller.dart';
 import 'hangup_tone_player.dart';
 import 'incoming_call_notification_controller.dart';
+import 'message_ringtone_player.dart';
 import 'notice_tone_player.dart';
 import 'proximity_screen_controller.dart';
 import 'screen_wake_controller.dart';
@@ -63,6 +65,14 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
   debugPrint('[MeshTalk][FCM] Background message received: ${message.data}');
+
+  // Phase 2: standby announcement. Isolated branch — returns before any of
+  // the `incoming_call` wake logic below runs, and never touches WebRTC,
+  // presence, the Foreground Service, or the `offer`/`answer` nodes.
+  if (message.data['type'] == 'announcement') {
+    await _handleAnnouncementFcm(message);
+    return;
+  }
 
   if (message.data['type'] != 'incoming_call') return;
 
@@ -128,6 +138,243 @@ Future<void> _writeFcmWakeupBreadcrumb(Map<String, Object?> patch) async {
   } catch (error) {
     debugPrint('[MeshTalk][FCM] breadcrumb write failed (continuing anyway): $error');
   }
+}
+
+/// Publishes an announcement to the shared RTDB `announcement` node and
+/// fires the Cloudflare Worker standby-wake — WITHOUT needing a live
+/// [SignalingService] / WebRTC call. Used both from inside an active call
+/// (via [SignalingService.sendAnnouncement]) and from the Caller's
+/// standalone "Umumkan ke Rumah" action (Phase 2). Returns `true` iff the
+/// RTDB write succeeded; every failure is caught and logged. `createdAt` is
+/// a client timestamp, matching the existing `offer` staleness scheme.
+Future<bool> publishAnnouncement(String text) async {
+  final trimmed = text.trim();
+  if (trimmed.isEmpty) {
+    debugPrint('[Announcement] send skipped: empty text');
+    return false;
+  }
+  final capped = trimmed.length > SignalingService.maxAnnouncementLength
+      ? trimmed.substring(0, SignalingService.maxAnnouncementLength)
+      : trimmed;
+  final roomRef = FirebaseDatabase.instance.ref(SignalingService.roomPath);
+  final id = roomRef.child('announcement').push().key ??
+      DateTime.now().microsecondsSinceEpoch.toString();
+  debugPrint('[Announcement] sending announcement id=$id len=${capped.length}');
+  try {
+    await roomRef.child('announcement').set({
+      'text': capped,
+      'createdAt': DateTime.now().millisecondsSinceEpoch,
+      'id': id,
+    }).timeout(const Duration(seconds: 10));
+    debugPrint('[Announcement] announcement sent id=$id');
+    // Phase 2: wake a standby / backgrounded / Doze Callee via the existing
+    // Cloudflare Worker `/wake` route (data-only FCM, `type: announcement`).
+    // Fire-and-forget and best-effort: a foreground Callee already gets it
+    // through the live RTDB listener, and a wake failure must never fail the
+    // send.
+    unawaited(_triggerAnnouncementWakeUp(roomRef, id));
+    return true;
+  } catch (error) {
+    debugPrint('[Announcement] send failed (call unaffected): $error');
+    return false;
+  }
+}
+
+/// Announcement counterpart to [SignalingService._triggerCalleeWakeUp]:
+/// reads the Callee's `callee_fcm_token` and POSTs it — with
+/// `type: announcement` + the announcement id — to the same Cloudflare
+/// Worker `/wake` route. The Worker (never this client) holds the FCM
+/// credential. Fully isolated / never awaited: a missing token, unreachable
+/// Worker, or any other failure only means the standby-wake path is
+/// unavailable for this announcement.
+Future<void> _triggerAnnouncementWakeUp(
+  DatabaseReference roomRef,
+  String announcementId,
+) async {
+  try {
+    final workerUrl = SignalingService._workerWakeUpUrl;
+    if (workerUrl == null || workerUrl.isEmpty) {
+      debugPrint(
+        '[Announcement][FCM] WORKER_WAKE_UP_URL not set -> standby wake unavailable',
+      );
+      return;
+    }
+    final snapshot = await roomRef.child('callee_fcm_token').get();
+    final fcmToken = snapshot.value as String?;
+    if (fcmToken == null || fcmToken.isEmpty) {
+      debugPrint(
+        '[Announcement][FCM] callee_fcm_token MISSING -> standby wake unavailable',
+      );
+      return;
+    }
+    final response = await http
+        .post(
+          Uri.parse(workerUrl),
+          headers: {'content-type': 'application/json'},
+          body: jsonEncode({
+            'roomId': 'rumah_utama',
+            'fcmToken': fcmToken,
+            'type': 'announcement',
+            'announcementId': announcementId,
+          }),
+        )
+        .timeout(const Duration(seconds: 10));
+    if (response.statusCode == 200) {
+      debugPrint('[Announcement][FCM] wake Worker call succeeded id=$announcementId');
+    } else {
+      debugPrint(
+        '[Announcement][FCM] wake Worker call failed (continuing anyway): '
+        'HTTP ${response.statusCode} ${response.body}',
+      );
+    }
+  } catch (error) {
+    debugPrint('[Announcement][FCM] wake Worker call failed (continuing anyway): $error');
+  }
+}
+
+/// Atomically claims the announcement identified by [id] for playback by
+/// transacting on the WHOLE `announcement` node (not just its `spokenId`
+/// child), so the claim is atomic with respect to the announcement's
+/// identity. Inside the transaction handler, `current` is the live node, so
+/// the commit only lands when the node STILL holds this exact announcement:
+///
+///  - node deleted by [SignalingService.cleanupRoom] mid-claim  -> abort;
+///    the node is NOT recreated (no zombie `announcement/spokenId`).
+///  - node replaced by a newer `publishAnnouncement()` `.set()` (a different
+///    `id`) -> abort; the newer announcement's node is never touched or
+///    polluted with a stale `spokenId`.
+///  - `spokenId` already == [id] (won by the foreground RTDB listener, or a
+///    prior duplicate FCM) -> abort.
+///  - otherwise -> merge `spokenId: id` into the node and commit.
+///
+/// RTDB re-runs the handler and re-checks server state at commit time, so a
+/// `.set()` / delete that interleaves the read cannot slip past — no
+/// timing/delay assumptions. Returns `true` iff THIS caller committed the
+/// claim (=> it should play); a clean abort returns `false` (skip). Only a
+/// thrown error (timeout / network) is fail-open (returns `true`) so a flaky
+/// background socket cannot silently swallow a valid announcement.
+Future<bool> _claimAnnouncementForPlayback(
+  DatabaseReference announcementRef,
+  String id,
+) async {
+  try {
+    final result = await announcementRef.runTransaction((currentData) {
+      if (currentData is! Map) {
+        // null (deleted by cleanupRoom / never existed) or an unexpected
+        // shape: do NOT write — that would resurrect the node.
+        return Transaction.abort();
+      }
+      final node = Map<String, Object?>.from(currentData);
+      if (node['id']?.toString() != id) {
+        // Superseded by another announcement — leave its node untouched.
+        return Transaction.abort();
+      }
+      if (node['spokenId']?.toString() == id) {
+        // Already claimed elsewhere (foreground listener / prior FCM).
+        return Transaction.abort();
+      }
+      node['spokenId'] = id;
+      return Transaction.success(node);
+    }).timeout(const Duration(seconds: 5));
+    return result.committed;
+  } catch (error) {
+    debugPrint('[Announcement][Dedup] claim transaction failed (fail-open): $error');
+    return true;
+  }
+}
+
+/// FCM `type: "announcement"` handler — runs in the headless background
+/// isolate (app backgrounded / terminated). It reads the authoritative text
+/// from RTDB (FCM carries only the id), validates + de-dupes, then plays the
+/// existing Phase 1 pipeline (message ringtone -> native TTS) through the
+/// `meshtalk_native` plugin channels, which ARE registered on this engine.
+///
+/// It deliberately does NOT: create a PeerConnection / call getUserMedia,
+/// touch audio mode / route / speakerphone, start or stop the Foreground
+/// Service, write `presence`, or alter any call state. Standby is left
+/// exactly as it was.
+Future<void> _handleAnnouncementFcm(RemoteMessage message) async {
+  final roomId = (message.data['room'] ?? message.data['roomId'])?.toString();
+  final fcmAnnouncementId = message.data['announcementId']?.toString();
+  debugPrint('[Announcement][FCM] received id=$fcmAnnouncementId room=$roomId');
+  if (roomId == null ||
+      roomId.isEmpty ||
+      fcmAnnouncementId == null ||
+      fcmAnnouncementId.isEmpty) {
+    debugPrint('[Announcement][FCM] ignored: missing room / announcementId');
+    return;
+  }
+
+  // Nudge the RTDB socket awake so the read below hits fresh data rather
+  // than a frozen/zombie background socket (same rationale as the
+  // incoming_call handler; a bare goOnline() is a cheap no-op if already
+  // connected).
+  try {
+    await FirebaseDatabase.instance.goOnline();
+  } catch (_) {}
+
+  final announcementRef =
+      FirebaseDatabase.instance.ref('intercom_rooms/$roomId/announcement');
+  Map<String, dynamic>? data;
+  try {
+    final snapshot =
+        await announcementRef.get().timeout(const Duration(seconds: 8));
+    final value = snapshot.value;
+    if (value is Map) data = Map<String, dynamic>.from(value);
+  } catch (error) {
+    debugPrint('[Announcement][RTDB] read failed (no TTS): $error');
+    return;
+  }
+  if (data == null) {
+    debugPrint(
+      '[Announcement][RTDB] node empty (cleared/superseded) id=$fcmAnnouncementId',
+    );
+    return;
+  }
+
+  final id = data['id']?.toString();
+  final text = (data['text']?.toString() ?? '').trim();
+  final createdAt = int.tryParse(data['createdAt']?.toString() ?? '');
+  final spokenId = data['spokenId']?.toString();
+  debugPrint('[Announcement][RTDB] loaded id=$id createdAt=$createdAt');
+
+  if (id == null || id.isEmpty || text.isEmpty || createdAt == null) {
+    debugPrint('[Announcement][RTDB] invalid payload id=$id -> no TTS');
+    return;
+  }
+  // Superseded: a newer announcement replaced the one this FCM was about.
+  if (id != fcmAnnouncementId) {
+    debugPrint(
+      '[Announcement][Dedup] ignored: FCM id=$fcmAnnouncementId != RTDB id=$id',
+    );
+    return;
+  }
+  // Already handled (main isolate listener, or a prior duplicate FCM).
+  if (spokenId == id) {
+    debugPrint('[Announcement][Dedup] ignored id=$id (already spoken)');
+    return;
+  }
+  if (!await _claimAnnouncementForPlayback(announcementRef, id)) {
+    debugPrint('[Announcement][Dedup] ignored id=$id (claimed elsewhere)');
+    return;
+  }
+
+  final capped = text.length > SignalingService.maxAnnouncementLength
+      ? text.substring(0, SignalingService.maxAnnouncementLength)
+      : text;
+  debugPrint('[Announcement][Queue] queued id=$id len=${capped.length}');
+
+  try {
+    debugPrint('[Announcement][Playback] ringtone start id=$id');
+    await MessageRingtonePlayer().play();
+    debugPrint('[Announcement][Playback] ringtone done id=$id');
+    debugPrint('[Announcement][TTS] start id=$id');
+    await AnnouncementService().speak(capped);
+    debugPrint('[Announcement][TTS] done id=$id');
+  } catch (error) {
+    debugPrint('[Announcement][TTS] error id=$id: $error');
+  }
+  debugPrint('[Announcement][Recovery] standby preserved (no PC / no FGS change)');
 }
 
 class SignalingService with WidgetsBindingObserver {
@@ -263,7 +510,7 @@ class SignalingService with WidgetsBindingObserver {
   /// [_maxCallDurationSeconds] as a data/quota guard.
   Timer? _callTimer;
   int _elapsedSeconds = 0;
-  static const int _maxCallDurationSeconds = 180;
+  static const int _maxCallDurationSeconds = 900; // 15 minutes
 
   /// Notifies the UI once per second while the call timer is running, so it
   /// can re-read [formattedCallDuration]. Mirrors the existing
@@ -283,6 +530,31 @@ class SignalingService with WidgetsBindingObserver {
   bool _hangupTonePlayed = false;
 
   final HangupTonePlayer _hangupTonePlayer = HangupTonePlayer();
+
+  /// Announcement TTS (Phase 1) — Callee side only. Playback is strictly
+  /// sequential: the message ringtone plays first (awaited to true
+  /// completion via [_messageRingtonePlayer]), then the text is handed to
+  /// native Android Text-to-Speech ([_announcementService]). Neither touches
+  /// AudioManager mode / speakerphone / audio focus / WebRTC tracks, so an
+  /// announcement can never disturb an active call — see the Announcement
+  /// TTS audit.
+  final AnnouncementService _announcementService = AnnouncementService();
+  final MessageRingtonePlayer _messageRingtonePlayer = MessageRingtonePlayer();
+
+  /// FIFO of announcement texts awaiting playback. Drained one at a time by
+  /// [_drainAnnouncementQueue] as `ringtone -> TTS`; the two never overlap.
+  final List<String> _announcementQueue = [];
+  bool _announcementPlaying = false;
+
+  /// `id` of the most recently accepted announcement — guards against the
+  /// RTDB `announcement` value being re-delivered by an `onValue` re-fire
+  /// (socket reconnect / listener re-attach) and spoken twice.
+  String? _lastAnnouncementId;
+
+  /// Upper bound on announcement length accepted from the Caller UI and
+  /// written to RTDB. The native TTS side additionally clamps to
+  /// `TextToSpeech.getMaxSpeechInputLength()`.
+  static const int maxAnnouncementLength = 200;
 
   /// Screen-off-near-ear during an active call. Started only once the call
   /// is truly connected, stopped the moment it stops being connected.
@@ -330,6 +602,10 @@ class SignalingService with WidgetsBindingObserver {
   StreamSubscription<DatabaseEvent>? _answerSub;
   StreamSubscription<DatabaseEvent>? _callerCandidatesSub;
   StreamSubscription<DatabaseEvent>? _calleeCandidatesSub;
+
+  /// Callee-side listener for the shared `announcement` node. Installed in
+  /// [startCallee] alongside `_offerSub`, torn down in [_cancelSubscriptions].
+  StreamSubscription<DatabaseEvent>? _announcementSub;
 
   /// Proactive network-transition detection (Wi-Fi <-> Cellular <-> none).
   /// On every real change, forces the Firebase RTDB socket reconnect cycle
@@ -487,11 +763,15 @@ class SignalingService with WidgetsBindingObserver {
         debugPrint(
           '[MeshTalk] call duration reached ${_maxCallDurationSeconds}s cap -> auto hangup',
         );
-        // Stop the ticker synchronously first so a slow hangup() cannot let
+        // Stop the ticker synchronously first so a slow teardown cannot let
         // a second tick fire and trigger a duplicate auto-hangup.
         _callTimer?.cancel();
         _callTimer = null;
-        unawaited(hangup());
+        // Role-aware teardown: the Caller returns to idle via hangup() (as
+        // before); the Callee runs the SAME cleanup + startCallee() standby
+        // recovery as a remote disconnect, so it never ends the call
+        // signaling-dead (no offer listener / no Foreground Service).
+        unawaited(_endActiveCall('call duration cap reached'));
       }
     });
   }
@@ -1014,10 +1294,12 @@ class SignalingService with WidgetsBindingObserver {
     await _answerSub?.cancel();
     await _callerCandidatesSub?.cancel();
     await _calleeCandidatesSub?.cancel();
+    await _announcementSub?.cancel();
     _offerSub = null;
     _answerSub = null;
     _callerCandidatesSub = null;
     _calleeCandidatesSub = null;
+    _announcementSub = null;
   }
 
   Future<void> _closePeerConnection() async {
@@ -1095,6 +1377,13 @@ class SignalingService with WidgetsBindingObserver {
     _stopProximityMonitoring();
     _fcmTokenRefreshSub?.cancel();
     _fcmTokenRefreshSub = null;
+    // Announcement (Phase 1): drop any queued/in-flight announcement so it
+    // can never leak into the next session, and halt native playback.
+    _announcementQueue.clear();
+    _announcementPlaying = false;
+    _lastAnnouncementId = null;
+    unawaited(_messageRingtonePlayer.stop());
+    unawaited(_announcementService.stop());
   }
 
   /// Clears the per-call signaling nodes (Firebase + local WebRTC state)
@@ -1136,6 +1425,7 @@ class SignalingService with WidgetsBindingObserver {
           'answer': null,
           'caller_candidates': null,
           'callee_candidates': null,
+          'announcement': null,
         }).timeout(const Duration(seconds: 3));
       } on TimeoutException catch (_) {
         debugPrint(
@@ -1343,6 +1633,15 @@ class SignalingService with WidgetsBindingObserver {
     );
     debugPrint('[CALLEE][session=$session] listener caller_candidates installed');
 
+    // Announcement (Phase 1): live listener on the shared `announcement`
+    // node. Session-guarded here; stale-timestamp + de-dupe guards live in
+    // [_handleAnnouncementEvent].
+    _announcementSub = _roomRef.child('announcement').onValue.listen((event) {
+      if (session != _sessionId) return;
+      _handleAnnouncementEvent(event);
+    });
+    debugPrint('[CALLEE][session=$session] listener announcement installed');
+
     _offerSub = _roomRef.child('offer').onValue.listen((event) async {
       if (session != _sessionId) return;
 
@@ -1462,6 +1761,107 @@ class SignalingService with WidgetsBindingObserver {
     debugPrint('[CALLEE][session=$session] listener offer installed');
 
     debugPrint('[CALLEE][session=$session] START COMPLETE ${_lifecycleSnapshot()}');
+  }
+
+  /// Caller-side: publishes an announcement to the shared RTDB
+  /// `announcement` node + fires the standby wake. Firebase-only — no TTS,
+  /// no UI, no WebRTC. Thin instance delegate to the top-level
+  /// [publishAnnouncement] so the exact same path is used from inside an
+  /// active call (this method, via `CallScreen`) and from the Caller's
+  /// no-call "Umumkan" action (Phase 2, via [publishAnnouncement] directly).
+  Future<bool> sendAnnouncement(String text) => publishAnnouncement(text);
+
+  /// Callee-side handler for the RTDB `announcement` node. Validates the
+  /// payload, applies the same stale-timestamp guard as the `offer`
+  /// listener, de-dupes by `id` (in-memory + the cross-isolate `spokenId`
+  /// marker written by the FCM background handler), atomically claims the
+  /// announcement, then enqueues sequential playback. Every failure path is
+  /// swallowed — an announcement must never disturb the call or Standby.
+  void _handleAnnouncementEvent(DatabaseEvent event) {
+    final value = event.snapshot.value;
+    if (value == null) return;
+    if (value is! Map) return;
+    final data = Map<String, dynamic>.from(value);
+
+    final id = data['id']?.toString();
+    final text = (data['text']?.toString() ?? '').trim();
+    final createdAt = int.tryParse(data['createdAt']?.toString() ?? '');
+    final spokenId = data['spokenId']?.toString();
+    if (id == null || id.isEmpty || text.isEmpty || createdAt == null) {
+      debugPrint('[Announcement] ignored: incomplete payload');
+      return;
+    }
+
+    // Already played — by this isolate earlier, or by the FCM background
+    // handler while the app was backgrounded (it writes `spokenId`).
+    if (id == _lastAnnouncementId || spokenId == id) {
+      _lastAnnouncementId = id;
+      debugPrint('[Announcement][Dedup] ignored id=$id (already spoken)');
+      return;
+    }
+
+    // Stale guard — identical rule to the offer listener: an announcement
+    // created before this Callee entered its current Standby session is old
+    // (e.g. left in RTDB by a previous call) and must not be replayed.
+    final activeSince = _calleeActiveSinceMillis;
+    if (activeSince == null || createdAt < activeSince) {
+      debugPrint(
+        '[Announcement] ignored as stale (createdAt=$createdAt activeSince=$activeSince)',
+      );
+      return;
+    }
+
+    _lastAnnouncementId = id;
+    final capped = text.length > maxAnnouncementLength
+        ? text.substring(0, maxAnnouncementLength)
+        : text;
+    debugPrint('[Announcement][RTDB] loaded id=$id len=${capped.length}');
+    unawaited(_claimAndQueueAnnouncement(id, capped));
+  }
+
+  /// Atomically claims [id] (shared with the FCM background handler via
+  /// [_claimAnnouncementForPlayback]) and, only if this isolate wins the
+  /// claim, appends it to the Phase 1 playback queue. Bounded at 5.
+  Future<void> _claimAndQueueAnnouncement(String id, String text) async {
+    if (!await _claimAnnouncementForPlayback(_roomRef.child('announcement'), id)) {
+      debugPrint('[Announcement][Dedup] ignored id=$id (claimed by FCM handler)');
+      return;
+    }
+    debugPrint('[Announcement][Queue] queued id=$id');
+    _announcementQueue.add(text);
+    // Bound the backlog: drop the oldest if announcements pile up faster
+    // than they can be spoken.
+    while (_announcementQueue.length > 5) {
+      _announcementQueue.removeAt(0);
+    }
+    unawaited(_drainAnnouncementQueue());
+  }
+
+  /// Plays queued announcements strictly one at a time: message ringtone,
+  /// then — only once it has actually finished — native TTS, then the next
+  /// entry. Ringtone and TTS never overlap. Re-entrancy-guarded by
+  /// [_announcementPlaying]; a mid-drain session change (cleanup/hangup
+  /// bumps `_sessionId`) stops the loop, and [_resetInternalState] clears
+  /// the queue/flag.
+  Future<void> _drainAnnouncementQueue() async {
+    if (_announcementPlaying) return;
+    _announcementPlaying = true;
+    final drainSession = _sessionId;
+    try {
+      while (_announcementQueue.isNotEmpty && drainSession == _sessionId) {
+        final text = _announcementQueue.removeAt(0);
+        debugPrint('[Announcement] playing message ringtone');
+        await _messageRingtonePlayer.play();
+        if (drainSession != _sessionId) break;
+        debugPrint('[Announcement] message ringtone completed -> starting TTS');
+        await _announcementService.speak(text);
+        debugPrint('[Announcement] TTS completed');
+      }
+    } catch (error) {
+      debugPrint('[Announcement] playback error (continuing): $error');
+    } finally {
+      _announcementPlaying = false;
+    }
   }
 
   void _listenCandidates({
@@ -1614,16 +2014,39 @@ class SignalingService with WidgetsBindingObserver {
   /// The remote peer ended the call (caller hangup / network drop). Callee
   /// cleans up all resources and automatically re-enters standby mode.
   Future<void> _onCallEndedByRemote() async {
+    await _endActiveCall('remote ended call');
+  }
+
+  /// Shared teardown for a call that ends WITHOUT the local user pressing
+  /// Hangup — the remote-hangup / peer-disconnect path
+  /// ([_onCallEndedByRemote]) and the [_maxCallDurationSeconds] duration cap
+  /// in [_startCallTimer] both route through here.
+  ///
+  /// Role-aware, reusing the long-standing remote-disconnect recovery
+  /// unchanged:
+  ///  - Caller: [hangup] -> full cleanup -> `SignalingState.idle` (exactly
+  ///    the pre-existing auto-hangup behavior).
+  ///  - Callee: [cleanupRoom] -> [startCallee], so the `offer` listener, the
+  ///    Standby Foreground Service, presence and the FCM-token refresh all
+  ///    come back and the house is ready for the next call — instead of
+  ///    being left idle with every standby subscription cancelled.
+  ///
+  /// [_autoResetting] collapses overlapping end-of-call signals (e.g. an ICE
+  /// `failed` landing at the same instant as the 15-minute cap) to a single
+  /// teardown. [cleanupRoom] is fully awaited before [startCallee]; both
+  /// bump [_sessionId], so any late callback from the finished call is
+  /// dropped by the existing `session != _sessionId` guards.
+  Future<void> _endActiveCall(String reason) async {
     if (_autoResetting) return;
     _autoResetting = true;
     _playHangupToneOnce();
     try {
       if (_isCaller) {
-        debugPrint('[MeshTalk] remote ended call on caller -> hangup');
+        debugPrint('[MeshTalk] $reason on caller -> hangup');
         await hangup();
         return;
       }
-      debugPrint('[MeshTalk] remote ended call on callee -> re-enter standby');
+      debugPrint('[MeshTalk] $reason on callee -> re-enter standby');
 
       final onRemote = onRemoteStream;
       final onState = onStateChanged;

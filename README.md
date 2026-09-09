@@ -41,7 +41,7 @@ MeshTalk turns two Android phones into a private, always-listening intercom: one
 - **STUN + multi-transport TURN relay** — UDP, TCP, and TLS-over-443 fallbacks so calls still connect behind strict NATs and firewalls.
 - **Foreground service** — keeps the Callee's process (and its Firebase listener) alive in the background, immune to most OEM battery killers.
 - **Proximity-aware screen** — screen turns off automatically when the phone is held to the ear mid-call.
-- **Auto-hangup safety net** — calls end automatically after 3 minutes if nobody hangs up manually.
+- **Auto-hangup safety net** — calls end automatically after 15 minutes if nobody hangs up manually.
 - **Liquid-glass UI** — a custom glassmorphism widget set for the call/standby screens.
 
 ## 🏗️ Architecture
@@ -276,7 +276,7 @@ worker/
 2. Grant battery-optimization and notification permissions when prompted.
 3. The app enters Standby (foreground service starts, presence is published as `ready`).
 4. An incoming call auto-answers with zero interaction — the screen wakes, a notification appears, and audio plays on speakerphone.
-5. The call ends automatically when the Caller hangs up, or after the 3-minute safety timeout.
+5. The call ends automatically when the Caller hangs up, or after the 15-minute safety timeout.
 
 ## 🔍 Key Implementation Details
 

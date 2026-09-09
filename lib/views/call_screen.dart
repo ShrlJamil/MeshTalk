@@ -33,6 +33,10 @@ class _CallScreenState extends State<CallScreen>
   /// cellular `cleanupRoom()` can never be triggered twice by repeated taps.
   bool _isEnding = false;
 
+  /// Caller-only announcement composer state.
+  final TextEditingController _announcementController = TextEditingController();
+  bool _sendingAnnouncement = false;
+
   bool get _isCaller => widget.mode == CallMode.caller;
 
   @override
@@ -59,6 +63,7 @@ class _CallScreenState extends State<CallScreen>
 
   @override
   void dispose() {
+    _announcementController.dispose();
     _pulseController.dispose();
     _audioRouteController?.dispose();
     unawaited(_service.dispose());
@@ -130,6 +135,81 @@ class _CallScreenState extends State<CallScreen>
 
   void _toggleAudioRoute() {
     unawaited(_audioRouteController?.toggle());
+  }
+
+  /// Caller-only: sends the typed announcement to the house via
+  /// [SignalingService.sendAnnouncement] (Firebase write only), then clears
+  /// the input and shows a short confirmation.
+  Future<void> _sendAnnouncement() async {
+    final text = _announcementController.text.trim();
+    if (text.isEmpty || _sendingAnnouncement) return;
+    setState(() => _sendingAnnouncement = true);
+    final sent = await _service.sendAnnouncement(text);
+    if (!mounted) return;
+    setState(() => _sendingAnnouncement = false);
+    final messenger = ScaffoldMessenger.of(context);
+    if (sent) {
+      _announcementController.clear();
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Pengumuman terkirim')),
+      );
+    } else {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Gagal mengirim pengumuman')),
+      );
+    }
+  }
+
+  /// Compact glass composer (TextField + send) for the Caller to broadcast
+  /// a short spoken announcement to the house. Uses existing glass
+  /// components and theme tokens only.
+  Widget _announcementComposer(MeshGlassPalette palette) {
+    final canSend =
+        _announcementController.text.trim().isNotEmpty && !_sendingAnnouncement;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 460),
+        child: GlassPanel(
+          borderRadius: 22,
+          padding: const EdgeInsets.fromLTRB(16, 4, 6, 4),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _announcementController,
+                  minLines: 1,
+                  maxLines: 3,
+                  maxLength: SignalingService.maxAnnouncementLength,
+                  textInputAction: TextInputAction.send,
+                  onChanged: (_) => setState(() {}),
+                  onSubmitted: (_) => _sendAnnouncement(),
+                  cursorColor: kAccentColor,
+                  style: TextStyle(color: palette.textPrimary, fontSize: 14),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    border: InputBorder.none,
+                    counterText: '',
+                    hintText: 'Umumkan ke rumah…',
+                    hintStyle:
+                        TextStyle(color: palette.textSecondary, fontSize: 14),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 4),
+              GlassDockButton(
+                icon: Icons.campaign_rounded,
+                tooltip: 'Kirim pengumuman',
+                diameter: 46,
+                iconSize: 20,
+                tint: kAccentColor,
+                onPressed: canSend ? _sendAnnouncement : null,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   String get _statusLabel {
@@ -264,60 +344,78 @@ class _CallScreenState extends State<CallScreen>
                   ),
                 ),
                 Expanded(
-                  child: Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        ScaleTransition(
-                          scale: _pulseController,
-                          child: Container(
-                            width: 140,
-                            height: 140,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: palette.cardFill,
-                              border: Border.all(color: palette.cardBorder, width: 1.5),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: statusColor.withValues(
-                                    alpha: isConnected ? 0.5 : 0.15,
+                  // Vertically centred as before; wrapped so it can scroll
+                  // instead of overflowing when the soft keyboard shrinks
+                  // this area for the Caller's announcement composer.
+                  child: LayoutBuilder(
+                    builder: (context, constraints) => SingleChildScrollView(
+                      child: ConstrainedBox(
+                        constraints:
+                            BoxConstraints(minHeight: constraints.maxHeight),
+                        child: Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              ScaleTransition(
+                                scale: _pulseController,
+                                child: Container(
+                                  width: 140,
+                                  height: 140,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    color: palette.cardFill,
+                                    border: Border.all(
+                                        color: palette.cardBorder, width: 1.5),
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color: statusColor.withValues(
+                                          alpha: isConnected ? 0.5 : 0.15,
+                                        ),
+                                        blurRadius: 40,
+                                        spreadRadius: 6,
+                                      ),
+                                    ],
                                   ),
-                                  blurRadius: 40,
-                                  spreadRadius: 6,
+                                  child: Icon(_statusIcon,
+                                      size: 56, color: statusColor),
                                 ),
-                              ],
-                            ),
-                            child: Icon(_statusIcon, size: 56, color: statusColor),
+                              ),
+                              const SizedBox(height: 20),
+                              Text(
+                                _statusLabel,
+                                style: TextStyle(
+                                  color: statusColor,
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                _remoteStream != null
+                                    ? 'Audio tersambung'
+                                    : 'Interkom Standby',
+                                style: TextStyle(
+                                    color: palette.textSecondary, fontSize: 13),
+                              ),
+                              const SizedBox(height: 28),
+                              // Call duration now lives solely in
+                              // DynamicLivePill (in GlassAppBar) — no
+                              // redundant big timer here. Center stage stays
+                              // focused on the status icon/text above once
+                              // connected; the mode buttons only show
+                              // pre-connection (and as a failed-state retry).
+                              if (!isConnected) _modeButtonsRow(),
+                            ],
                           ),
                         ),
-                        const SizedBox(height: 20),
-                        Text(
-                          _statusLabel,
-                          style: TextStyle(
-                            color: statusColor,
-                            fontSize: 22,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(
-                          _remoteStream != null ? 'Audio tersambung' : 'Interkom Standby',
-                          style: TextStyle(color: palette.textSecondary, fontSize: 13),
-                        ),
-                        const SizedBox(height: 28),
-                        // Call duration now lives solely in DynamicLivePill
-                        // (in GlassAppBar) — no redundant big timer here.
-                        // Center stage stays focused on the status icon/text
-                        // above once connected; the mode buttons only show
-                        // pre-connection (and as a failed-state retry).
-                        if (!isConnected) _modeButtonsRow(),
-                      ],
+                      ),
                     ),
                   ),
                 ),
-                // Reserve space so the floating dock never overlaps content
-                // scrolled to the bottom of the Column above.
-                const SizedBox(height: 116),
+                // Reserve space so the floating dock (and, for the Caller,
+                // the announcement composer stacked above it) never overlaps
+                // content scrolled to the bottom of the Column above.
+                SizedBox(height: _isCaller ? 196 : 116),
               ],
             ),
           ),
@@ -329,7 +427,14 @@ class _CallScreenState extends State<CallScreen>
               top: false,
               child: Padding(
                 padding: const EdgeInsets.only(bottom: 24),
-                child: Center(child: _controlDock(isConnected)),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (_isCaller) _announcementComposer(palette),
+                    if (_isCaller) const SizedBox(height: 14),
+                    Center(child: _controlDock(isConnected)),
+                  ],
+                ),
               ),
             ),
           ),

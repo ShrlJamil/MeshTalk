@@ -67,6 +67,8 @@ const WAKE_UP_TTL_SECONDS = 60;
 // scope to include database access just for a debug write.
 const DATABASE_URL = 'https://meshtalk-95d6e-default-rtdb.asia-southeast1.firebasedatabase.app';
 const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+// Firebase push-id shaped (also tolerates a micros-epoch fallback id).
+const ANNOUNCEMENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -77,6 +79,27 @@ function jsonResponse(body, status = 200) {
 
 function breadcrumbUrl(roomId) {
   return `${DATABASE_URL}/intercom_rooms/${roomId}/debug/fcm_wakeup.json`;
+}
+
+/**
+ * Phase 2 announcement wake diagnostics — a SEPARATE node from
+ * `debug/fcm_wakeup` so the incoming_call breadcrumb trace is never
+ * perturbed. Best-effort, same unauthenticated-REST trust boundary.
+ */
+function announcementBreadcrumbUrl(roomId) {
+  return `${DATABASE_URL}/intercom_rooms/${roomId}/debug/announcement_wakeup.json`;
+}
+
+async function patchAnnouncementBreadcrumb(roomId, patch) {
+  try {
+    await fetch(announcementBreadcrumbUrl(roomId), {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+  } catch (error) {
+    console.error('[meshtalk-wake] announcement breadcrumb patch failed (continuing anyway):', error);
+  }
 }
 
 /**
@@ -191,7 +214,7 @@ async function getAccessToken(serviceAccount) {
  * messages/..."}` response shape) for the breadcrumb trace, or `null` if
  * the response couldn't be parsed as expected — never throws on that.
  */
-async function sendFcmWakeUp(accessToken, fcmToken, roomId) {
+async function sendFcmDataMessage(accessToken, fcmToken, data) {
   const response = await fetch(FCM_ENDPOINT, {
     method: 'POST',
     headers: {
@@ -201,10 +224,7 @@ async function sendFcmWakeUp(accessToken, fcmToken, roomId) {
     body: JSON.stringify({
       message: {
         token: fcmToken,
-        data: {
-          type: 'incoming_call',
-          room: roomId,
-        },
+        data,
         android: {
           // High priority is required to punch through Doze; normal
           // priority gets deferred to the next maintenance window, which
@@ -228,6 +248,30 @@ async function sendFcmWakeUp(accessToken, fcmToken, roomId) {
   }
 }
 
+/**
+ * The original incoming_call "doorbell" — payload byte-identical to before
+ * the Phase 2 refactor. Do not change.
+ */
+function sendFcmWakeUp(accessToken, fcmToken, roomId) {
+  return sendFcmDataMessage(accessToken, fcmToken, {
+    type: 'incoming_call',
+    room: roomId,
+  });
+}
+
+/**
+ * Phase 2: standby-announcement wake. Same transport as the doorbell
+ * (data-only, high priority, same TTL) but a distinct `type` and it carries
+ * only the announcement id — the text stays authoritative in RTDB.
+ */
+function sendFcmAnnouncement(accessToken, fcmToken, roomId, announcementId) {
+  return sendFcmDataMessage(accessToken, fcmToken, {
+    type: 'announcement',
+    room: roomId,
+    announcementId,
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -242,7 +286,7 @@ export default {
       return jsonResponse({ success: false, error: 'invalid_json' }, 400);
     }
 
-    const { roomId, fcmToken } = requestBody ?? {};
+    const { roomId, fcmToken, type, announcementId } = requestBody ?? {};
     if (!roomId || !fcmToken) {
       return jsonResponse({ success: false, error: 'roomId and fcmToken are required' }, 400);
     }
@@ -253,10 +297,22 @@ export default {
       return jsonResponse({ success: false, error: 'invalid roomId' }, 400);
     }
 
-    // Fire-and-forget: resets the breadcrumb node for this attempt without
-    // making the actual wake-up wait on it. `ctx.waitUntil` lets this
-    // complete after the response is returned, rather than blocking it.
-    ctx.waitUntil(resetBreadcrumb(roomId));
+    // Phase 2: standby-announcement wake. Fully isolated from the
+    // incoming_call path — its own FCM `type`, its own diagnostics node, and
+    // it deliberately does NOT reset `debug/fcm_wakeup` (that trace belongs
+    // to incoming_call only). Everything else about incoming_call is
+    // untouched.
+    const isAnnouncement = type === 'announcement';
+    if (isAnnouncement && !ANNOUNCEMENT_ID_PATTERN.test(announcementId ?? '')) {
+      return jsonResponse({ success: false, error: 'invalid announcementId' }, 400);
+    }
+
+    if (!isAnnouncement) {
+      // Fire-and-forget: resets the breadcrumb node for this attempt without
+      // making the actual wake-up wait on it. `ctx.waitUntil` lets this
+      // complete after the response is returned, rather than blocking it.
+      ctx.waitUntil(resetBreadcrumb(roomId));
+    }
 
     let serviceAccount;
     try {
@@ -268,6 +324,26 @@ export default {
 
     try {
       const accessToken = await getAccessToken(serviceAccount);
+
+      if (isAnnouncement) {
+        const messageId = await sendFcmAnnouncement(
+          accessToken,
+          fcmToken,
+          roomId,
+          announcementId,
+        );
+        ctx.waitUntil(
+          patchAnnouncementBreadcrumb(roomId, {
+            announcement_id: announcementId,
+            fcm_attempted: true,
+            fcm_sent_at: { '.sv': 'timestamp' },
+            fcm_message_id: messageId,
+            last_error: null,
+          }),
+        );
+        return jsonResponse({ success: true });
+      }
+
       const messageId = await sendFcmWakeUp(accessToken, fcmToken, roomId);
       ctx.waitUntil(
         patchBreadcrumb(roomId, {
@@ -283,14 +359,26 @@ export default {
       // already returned in the response below — never the service account
       // JSON, its private key, or the FCM token itself.
       const safeError = String(error).slice(0, 300);
-      ctx.waitUntil(
-        patchBreadcrumb(roomId, {
-          fcm_attempted: true,
-          fcm_sent_at: null,
-          fcm_message_id: null,
-          last_error: safeError,
-        }),
-      );
+      if (isAnnouncement) {
+        ctx.waitUntil(
+          patchAnnouncementBreadcrumb(roomId, {
+            announcement_id: announcementId,
+            fcm_attempted: true,
+            fcm_sent_at: null,
+            fcm_message_id: null,
+            last_error: safeError,
+          }),
+        );
+      } else {
+        ctx.waitUntil(
+          patchBreadcrumb(roomId, {
+            fcm_attempted: true,
+            fcm_sent_at: null,
+            fcm_message_id: null,
+            last_error: safeError,
+          }),
+        );
+      }
       console.error('[meshtalk-wake] wake-up failed:', error);
       return jsonResponse({ success: false, error: String(error) }, 502);
     }

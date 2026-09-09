@@ -50,6 +50,12 @@ class MainActivity : FlutterActivity() {
     private val hangupTone = SoundPoolTone(HANGUP_TONE_ASSET, HANGUP_TONE_MAX_DURATION_MS)
     private val screenWaker by lazy { ScreenWakeManager(applicationContext) }
 
+    // Announcement TTS + message ringtone now live in the `meshtalk_native`
+    // local plugin (packages/meshtalk_native): its MeshTalkNativePlugin
+    // registers the `meshtalk/tts` and `meshtalk/message_ringtone` channels
+    // on EVERY FlutterEngine, including the headless one firebase_messaging
+    // uses for onBackgroundMessage. Nothing to wire here anymore.
+
     // Lets an incoming/active call surface fullscreen over the lockscreen and
     // turn the display on, matching standard VoIP/dialer app behavior on the
     // Callee side. Re-applied on every onResume since these flags are not
