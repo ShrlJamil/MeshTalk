@@ -2,6 +2,7 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 
+import '../design/mesh_design.dart';
 import '../services/signaling_service.dart';
 import '../theme.dart';
 
@@ -378,26 +379,11 @@ class GlassDockButton extends StatelessWidget {
   }
 }
 
-const TextStyle _kPillText = TextStyle(
-  color: Colors.white,
-  fontSize: 13,
-  fontWeight: FontWeight.w600,
-);
-
-const TextStyle _kPillMono = TextStyle(
-  color: Colors.white,
-  fontSize: 13,
-  fontWeight: FontWeight.w700,
-  fontFamily: 'monospace',
-  letterSpacing: 0.5,
-);
-
-/// iOS "Dynamic Island" / Live Activity style status pill. Floats
-/// independently of any header/app bar. In the Idle state it's just clean
-/// text with no wrapping box; for every other [SignalingState] it fluidly
-/// expands (via [AnimatedSize]) into a dense glass capsule, cross-fading
-/// its inner icon+text (via [AnimatedSwitcher]) as the state changes —
-/// replacing the old rigid bordered "status box + glowing dot" pattern.
+/// Call-state status pill (solid MeshTalk treatment). Content and behavior
+/// are unchanged — idle shows [idleLabel], every other [SignalingState]
+/// fluidly resizes (via [AnimatedSize]) and cross-fades (via
+/// [AnimatedSwitcher]) — but the glass capsule, blur and glow are gone:
+/// solid surface, hairline border, flat dot.
 class DynamicLivePill extends StatelessWidget {
   const DynamicLivePill({
     super.key,
@@ -417,62 +403,33 @@ class DynamicLivePill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    final palette = glassPaletteFor(Theme.of(context).brightness);
-    // Dense/near-opaque black glass regardless of Light/Dark palette — a
-    // Dynamic Island capsule reads as a system-level overlay, not a themed
-    // app card, so it deliberately does NOT use MeshGlassPalette.cardFill.
-    final capsuleColor =
-        isDark ? Colors.black.withValues(alpha: 0.65) : Colors.black.withValues(alpha: 0.85);
-
     return AnimatedSize(
       duration: const Duration(milliseconds: 320),
       curve: Curves.easeOutCubic,
       alignment: Alignment.center,
       child: _isActive
-          ? ClipRRect(
+          ? Container(
               key: const ValueKey('live-pill-active'),
-              borderRadius: BorderRadius.circular(999),
-              child: BackdropFilter(
-                filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
-                // AnimatedSize (rather than AnimatedContainer) drives the
-                // fluid capsule resize as inner content width changes
-                // (e.g. "Memanggil..." -> "01:24"), since _SpecularBorder
-                // itself is a plain, non-implicitly-animated widget.
-                child: AnimatedSize(
-                  duration: const Duration(milliseconds: 320),
-                  curve: Curves.easeOutCubic,
-                  alignment: Alignment.center,
-                  child: _SpecularBorder(
-                    borderRadius: 999,
-                    fillColor: capsuleColor,
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
-                      child: AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 220),
-                        transitionBuilder: (child, animation) => FadeTransition(
-                          opacity: animation,
-                          child: ScaleTransition(scale: animation, child: child),
-                        ),
-                        child: _content(),
-                      ),
-                    ),
-                  ),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(
+                color: MeshSurface.surface,
+                borderRadius: BorderRadius.circular(MeshRadius.pill),
+                border: Border.all(color: MeshNeutral.border),
+              ),
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 220),
+                transitionBuilder: (child, animation) => FadeTransition(
+                  opacity: animation,
+                  child: ScaleTransition(scale: animation, child: child),
                 ),
+                child: _content(),
               ),
             )
           : Padding(
               key: const ValueKey('live-pill-idle'),
-              padding: const EdgeInsets.symmetric(vertical: 9),
-              child: Text(
-                idleLabel,
-                style: TextStyle(
-                  color: palette.textPrimary.withValues(alpha: 0.7),
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: 0.2,
-                ),
-              ),
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Text(idleLabel, style: MeshText.statusSecondary),
             ),
     );
   }
@@ -488,7 +445,7 @@ class DynamicLivePill extends StatelessWidget {
           children: [
             _PillPulseDot(),
             SizedBox(width: 8),
-            Text('Memanggil...', style: _kPillText),
+            Text('Calling…', style: MeshText.status),
           ],
         );
       case SignalingState.connected:
@@ -496,9 +453,14 @@ class DynamicLivePill extends StatelessWidget {
           key: const ValueKey('connected'),
           mainAxisSize: MainAxisSize.min,
           children: [
-            const _PillDot(color: Color(0xFF32D74B)),
+            const MeshStatusDot(color: MeshLive.connected),
             const SizedBox(width: 8),
-            Text(formattedDuration, style: _kPillMono),
+            Text(
+              formattedDuration,
+              style: MeshText.status.copyWith(
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
           ],
         );
       case SignalingState.failed:
@@ -506,9 +468,17 @@ class DynamicLivePill extends StatelessWidget {
           key: ValueKey('failed'),
           mainAxisSize: MainAxisSize.min,
           children: [
-            _PillDot(color: Color(0xFFFF453A)),
+            MeshStatusDot(color: MeshAlert.dangerText),
             SizedBox(width: 8),
-            Text('Terputus', style: _kPillText),
+            Text(
+              'Call failed',
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: MeshAlert.dangerText,
+                height: 1.3,
+              ),
+            ),
           ],
         );
       case SignalingState.disconnected:
@@ -516,38 +486,17 @@ class DynamicLivePill extends StatelessWidget {
           key: ValueKey('disconnected'),
           mainAxisSize: MainAxisSize.min,
           children: [
-            _PillDot(color: Colors.orangeAccent),
+            MeshStatusDot(color: MeshNeutral.textSecondary),
             SizedBox(width: 8),
-            Text('Terputus', style: _kPillText),
+            Text('Connection lost', style: MeshText.statusSecondary),
           ],
         );
     }
   }
 }
 
-/// Small static status dot with a soft glow — the micro icon for
-/// Connected/Failed/Disconnected inside [DynamicLivePill].
-class _PillDot extends StatelessWidget {
-  const _PillDot({required this.color});
-
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 8,
-      height: 8,
-      decoration: BoxDecoration(
-        color: color,
-        shape: BoxShape.circle,
-        boxShadow: [BoxShadow(color: color.withValues(alpha: 0.6), blurRadius: 6)],
-      ),
-    );
-  }
-}
-
-/// Small looping pulse animation — the mini pulse icon for the Connecting
-/// state inside [DynamicLivePill].
+/// Small looping pulse indicator — the mini pulse icon for the Connecting
+/// state inside [DynamicLivePill]. Cyan: connecting is a live action.
 class _PillPulseDot extends StatefulWidget {
   const _PillPulseDot();
 
@@ -575,7 +524,7 @@ class _PillPulseDotState extends State<_PillPulseDot>
         CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
       ),
       child: const DecoratedBox(
-        decoration: BoxDecoration(color: Colors.white70, shape: BoxShape.circle),
+        decoration: BoxDecoration(color: MeshLive.connected, shape: BoxShape.circle),
         child: SizedBox(width: 8, height: 8),
       ),
     );

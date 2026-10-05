@@ -3,13 +3,19 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import '../design/mesh_design.dart';
 import '../services/audio_route_controller.dart';
 import '../services/signaling_service.dart';
-import '../theme.dart';
 import '../widgets/liquid_glass.dart';
 
 enum CallMode { caller, callee }
 
+/// Active call / standby screen in the solid MeshTalk treatment.
+///
+/// Visual migration only — every behavior below is unchanged:
+/// signaling lifecycle, auto-answer, call timer + 900s cap, hangup and
+/// remote-ended handling, mic/route control wiring, announcement send,
+/// retry, standby (FGS/WifiLock/heartbeat/presence) via [SignalingService].
 class CallScreen extends StatefulWidget {
   const CallScreen({super.key, required this.mode});
 
@@ -19,10 +25,8 @@ class CallScreen extends StatefulWidget {
   State<CallScreen> createState() => _CallScreenState();
 }
 
-class _CallScreenState extends State<CallScreen>
-    with SingleTickerProviderStateMixin {
+class _CallScreenState extends State<CallScreen> {
   late final SignalingService _service;
-  late final AnimationController _pulseController;
   AudioRouteController? _audioRouteController;
   AudioRoute _audioRoute = AudioRoute.speaker;
 
@@ -39,6 +43,9 @@ class _CallScreenState extends State<CallScreen>
 
   bool get _isCaller => widget.mode == CallMode.caller;
 
+  /// Remote endpoint name shown in titles.
+  String get _remoteName => _isCaller ? 'Callee' : 'Caller';
+
   @override
   void initState() {
     super.initState();
@@ -46,12 +53,6 @@ class _CallScreenState extends State<CallScreen>
       ..onCallDurationTick = () {
         if (mounted) setState(() {});
       };
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1200),
-      lowerBound: 0.6,
-      upperBound: 1.2,
-    );
     if (_isCaller) {
       _audioRouteController = AudioRouteController()
         ..onRouteChanged = (route) {
@@ -64,7 +65,6 @@ class _CallScreenState extends State<CallScreen>
   @override
   void dispose() {
     _announcementController.dispose();
-    _pulseController.dispose();
     _audioRouteController?.dispose();
     unawaited(_service.dispose());
     super.dispose();
@@ -105,10 +105,7 @@ class _CallScreenState extends State<CallScreen>
     if (!mounted) return;
     setState(() => _state = state);
     if (state == SignalingState.connected) {
-      _pulseController.repeat(reverse: true);
       _audioRouteController?.refresh();
-    } else {
-      _pulseController.reset();
     }
   }
 
@@ -137,7 +134,7 @@ class _CallScreenState extends State<CallScreen>
     unawaited(_audioRouteController?.toggle());
   }
 
-  /// Caller-only: sends the typed announcement to the house via
+  /// Caller-only: sends the typed announcement via
   /// [SignalingService.sendAnnouncement] (Firebase write only), then clears
   /// the input and shows a short confirmation.
   Future<void> _sendAnnouncement() async {
@@ -151,294 +148,677 @@ class _CallScreenState extends State<CallScreen>
     if (sent) {
       _announcementController.clear();
       messenger.showSnackBar(
-        const SnackBar(content: Text('Pengumuman terkirim')),
+        const SnackBar(content: Text('Announcement sent')),
       );
     } else {
       messenger.showSnackBar(
-        const SnackBar(content: Text('Gagal mengirim pengumuman')),
+        const SnackBar(content: Text('Failed to send announcement')),
       );
     }
-  }
-
-  /// Compact glass composer (TextField + send) for the Caller to broadcast
-  /// a short spoken announcement to the house. Uses existing glass
-  /// components and theme tokens only.
-  Widget _announcementComposer(MeshGlassPalette palette) {
-    final canSend =
-        _announcementController.text.trim().isNotEmpty && !_sendingAnnouncement;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 20),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 460),
-        child: GlassPanel(
-          borderRadius: 22,
-          padding: const EdgeInsets.fromLTRB(16, 4, 6, 4),
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _announcementController,
-                  minLines: 1,
-                  maxLines: 3,
-                  maxLength: SignalingService.maxAnnouncementLength,
-                  textInputAction: TextInputAction.send,
-                  onChanged: (_) => setState(() {}),
-                  onSubmitted: (_) => _sendAnnouncement(),
-                  cursorColor: kAccentColor,
-                  style: TextStyle(color: palette.textPrimary, fontSize: 14),
-                  decoration: InputDecoration(
-                    isDense: true,
-                    border: InputBorder.none,
-                    counterText: '',
-                    hintText: 'Umumkan ke rumah…',
-                    hintStyle:
-                        TextStyle(color: palette.textSecondary, fontSize: 14),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 4),
-              GlassDockButton(
-                icon: Icons.campaign_rounded,
-                tooltip: 'Kirim pengumuman',
-                diameter: 46,
-                iconSize: 20,
-                tint: kAccentColor,
-                onPressed: canSend ? _sendAnnouncement : null,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  String get _statusLabel {
-    switch (_state) {
-      case SignalingState.connecting:
-        return _isCaller ? 'Menghubungi...' : 'Menunggu Panggilan...';
-      case SignalingState.connected:
-        return 'Tersambung';
-      case SignalingState.disconnected:
-        return 'Terputus';
-      case SignalingState.failed:
-        return 'Gagal Terhubung';
-      case SignalingState.idle:
-        return _isCaller ? 'Siap' : 'Standby';
-    }
-  }
-
-  Color _statusColor(MeshGlassPalette palette) {
-    switch (_state) {
-      case SignalingState.connected:
-        return kAccentColor;
-      case SignalingState.failed:
-        return kDangerColor;
-      case SignalingState.disconnected:
-        return Colors.orangeAccent;
-      default:
-        return palette.textSecondary;
-    }
-  }
-
-  IconData get _statusIcon {
-    if (_state == SignalingState.connected) return Icons.volume_up_rounded;
-    return _isCaller ? Icons.call_rounded : Icons.headset_mic_rounded;
-  }
-
-  /// The two large symmetric mode icons. Only the button matching this
-  /// screen's actual mode is ever interactive (as a retry, and only once
-  /// the handshake has failed) — the other is shown dimmed purely so the
-  /// pair reads as a deliberate, balanced pair rather than a missing button.
-  Widget _modeButtonsRow() {
-    final canRetry = _state == SignalingState.failed;
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Opacity(
-          opacity: _isCaller ? 0.35 : 1,
-          child: GlassCircleButton(
-            icon: Icons.headset_mic_rounded,
-            label: 'Standby',
-            tooltip: 'Aktifkan Standby',
-            tint: kStandbyAccentColor,
-            onPressed: (!_isCaller && canRetry) ? _retry : null,
-          ),
-        ),
-        const SizedBox(width: 28),
-        Opacity(
-          opacity: _isCaller ? 1 : 0.35,
-          child: GlassCircleButton(
-            icon: Icons.call_rounded,
-            label: 'Call',
-            tooltip: 'Mulai Panggilan',
-            tint: kCallAccentColor,
-            onPressed: (_isCaller && canRetry) ? _retry : null,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _controlDock(bool isConnected) {
-    final isMuted = _service.isMicMuted;
-    final (audioIcon, audioTooltip) = switch (_audioRoute) {
-      AudioRoute.speaker => (Icons.volume_up_rounded, 'Speaker aktif — ketuk untuk earpiece'),
-      AudioRoute.earpiece => (Icons.phone_in_talk_rounded, 'Earpiece aktif — ketuk untuk speaker'),
-      AudioRoute.headset => (Icons.headset_rounded, 'Headset aktif'),
-    };
-    return GlassDock(
-      children: [
-        GlassDockButton(
-          icon: isMuted ? Icons.mic_off_rounded : Icons.mic_rounded,
-          tooltip: isMuted ? 'Nyalakan mic' : 'Matikan mic',
-          active: isMuted,
-          tint: isMuted ? kDangerColor : null,
-          onPressed: _toggleMic,
-        ),
-        const SizedBox(width: 20),
-        GlassDockButton(
-          icon: Icons.call_end_rounded,
-          tooltip: isConnected
-              ? 'Akhiri panggilan'
-              : (_isCaller ? 'Batalkan panggilan' : 'Matikan mode standby'),
-          diameter: 64,
-          iconSize: 30,
-          tint: kDangerColor,
-          // Locked instantly once tapped — see _hangup().
-          onPressed: _isEnding ? null : _hangup,
-        ),
-        const SizedBox(width: 20),
-        GlassDockButton(
-          icon: audioIcon,
-          tooltip: audioTooltip,
-          active: _audioRoute != AudioRoute.earpiece,
-          // Route switching is caller-only: AudioRouteController is never
-          // started for the Callee (see initState) since its output route
-          // is fixed to speaker right after handshake, not user-toggleable.
-          onPressed: _isCaller ? _toggleAudioRoute : null,
-        ),
-      ],
-    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final palette = glassPaletteFor(Theme.of(context).brightness);
-    final statusColor = _statusColor(palette);
     final isConnected = _state == SignalingState.connected;
 
     return Scaffold(
-      backgroundColor: palette.background,
-      body: Stack(
-        children: [
-          const Positioned.fill(child: GlassBackdrop()),
-          SafeArea(
+      backgroundColor: MeshSurface.background,
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints:
+                const BoxConstraints(maxWidth: MeshSize.maxContentWidth),
             child: Column(
               children: [
-                GlassAppBar(
-                  title: 'MeshTalk',
-                  center: DynamicLivePill(
-                    state: _state,
-                    formattedDuration: _service.formattedCallDuration,
-                    idleLabel: 'Target',
+                // Top application area — same language as HomeScreen.
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                    MeshSize.screenMargin,
+                    MeshSpace.lg,
+                    MeshSize.screenMargin,
+                    MeshSpace.sm,
+                  ),
+                  child: _Header(isCaller: _isCaller),
+                ),
+                const Divider(
+                  height: 1,
+                  thickness: 1,
+                  color: MeshNeutral.border,
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                    MeshSize.screenMargin,
+                    MeshSpace.md,
+                    MeshSize.screenMargin,
+                    0,
+                  ),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: DynamicLivePill(
+                      state: _state,
+                      formattedDuration: _service.formattedCallDuration,
+                      idleLabel: _isCaller ? 'Callee' : 'Standby',
+                    ),
                   ),
                 ),
                 Expanded(
-                  // Vertically centred as before; wrapped so it can scroll
-                  // instead of overflowing when the soft keyboard shrinks
-                  // this area for the Caller's announcement composer.
+                  // Scrolls instead of overflowing when the soft keyboard
+                  // shrinks this area for the announcement composer.
                   child: LayoutBuilder(
-                    builder: (context, constraints) => SingleChildScrollView(
+                    builder: (context, constraints) =>
+                        SingleChildScrollView(
                       child: ConstrainedBox(
-                        constraints:
-                            BoxConstraints(minHeight: constraints.maxHeight),
+                        constraints: BoxConstraints(
+                            minHeight: constraints.maxHeight),
                         child: Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              ScaleTransition(
-                                scale: _pulseController,
-                                child: Container(
-                                  width: 140,
-                                  height: 140,
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    color: palette.cardFill,
-                                    border: Border.all(
-                                        color: palette.cardBorder, width: 1.5),
-                                    boxShadow: [
-                                      BoxShadow(
-                                        color: statusColor.withValues(
-                                          alpha: isConnected ? 0.5 : 0.15,
-                                        ),
-                                        blurRadius: 40,
-                                        spreadRadius: 6,
-                                      ),
-                                    ],
-                                  ),
-                                  child: Icon(_statusIcon,
-                                      size: 56, color: statusColor),
-                                ),
-                              ),
-                              const SizedBox(height: 20),
-                              Text(
-                                _statusLabel,
-                                style: TextStyle(
-                                  color: statusColor,
-                                  fontSize: 22,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                _remoteStream != null
-                                    ? 'Audio tersambung'
-                                    : 'Interkom Standby',
-                                style: TextStyle(
-                                    color: palette.textSecondary, fontSize: 13),
-                              ),
-                              const SizedBox(height: 28),
-                              // Call duration now lives solely in
-                              // DynamicLivePill (in GlassAppBar) — no
-                              // redundant big timer here. Center stage stays
-                              // focused on the status icon/text above once
-                              // connected; the mode buttons only show
-                              // pre-connection (and as a failed-state retry).
-                              if (!isConnected) _modeButtonsRow(),
-                            ],
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: MeshSize.screenMargin),
+                            child: _StateBody(
+                              state: _state,
+                              isCaller: _isCaller,
+                              remoteName: _remoteName,
+                              hasAudio: _remoteStream != null,
+                              formattedDuration:
+                                  _service.formattedCallDuration,
+                              isMicMuted: _service.isMicMuted,
+                              audioRoute: _audioRoute,
+                              onToggleMic: _toggleMic,
+                              onToggleRoute: _toggleAudioRoute,
+                              onRetry: _retry,
+                              onBack: _hangup,
+                            ),
                           ),
                         ),
                       ),
                     ),
                   ),
                 ),
-                // Reserve space so the floating dock (and, for the Caller,
-                // the announcement composer stacked above it) never overlaps
-                // content scrolled to the bottom of the Column above.
-                SizedBox(height: _isCaller ? 196 : 116),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(
+                    MeshSize.screenMargin,
+                    MeshSpace.md,
+                    MeshSize.screenMargin,
+                    MeshSpace.xl,
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_isCaller &&
+                          (isConnected ||
+                              _state == SignalingState.connecting))
+                        _AnnouncementComposer(
+                          controller: _announcementController,
+                          sending: _sendingAnnouncement,
+                          onChanged: (_) => setState(() {}),
+                          onSend: _sendAnnouncement,
+                        ),
+                      if (_isCaller &&
+                          (isConnected ||
+                              _state == SignalingState.connecting))
+                        const SizedBox(height: MeshSpace.md),
+                      _BottomControls(
+                        state: _state,
+                        isCaller: _isCaller,
+                        isEnding: _isEnding,
+                        onHangup: _hangup,
+                        onRetry: _retry,
+                      ),
+                    ],
+                  ),
+                ),
               ],
             ),
           ),
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: SafeArea(
-              top: false,
-              child: Padding(
-                padding: const EdgeInsets.only(bottom: 24),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (_isCaller) _announcementComposer(palette),
-                    if (_isCaller) const SizedBox(height: 14),
-                    Center(child: _controlDock(isConnected)),
-                  ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Top bar: MeshTalk wordmark + static role indicator.
+///
+/// The indicator mirrors HomeScreen's selector visually but is
+/// deliberately non-interactive — CallScreen's lifecycle does not support
+/// switching roles mid-screen.
+class _Header extends StatelessWidget {
+  const _Header({required this.isCaller});
+
+  final bool isCaller;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        const Row(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            _Bar(height: 10, color: MeshBrand.primaryAction),
+            SizedBox(width: 2),
+            _Bar(height: 15, color: MeshLive.connected),
+            SizedBox(width: 2),
+            _Bar(height: 8, color: MeshNeutral.icon),
+            SizedBox(width: 8),
+            Text(
+              'MeshTalk',
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+                color: MeshNeutral.textPrimary,
+              ),
+            ),
+          ],
+        ),
+        const Spacer(),
+        IgnorePointer(
+          child: Container(
+            padding: const EdgeInsets.all(MeshSpace.xs),
+            decoration: BoxDecoration(
+              color: MeshSurface.surface,
+              borderRadius: BorderRadius.circular(MeshRadius.sm),
+              border: Border.all(color: MeshNeutral.border),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _RoleLabel(label: MeshTerms.caller, active: isCaller),
+                _RoleLabel(label: MeshTerms.callee, active: !isCaller),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _Bar extends StatelessWidget {
+  const _Bar({required this.height, required this.color});
+
+  final double height;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 4,
+      height: height,
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(1),
+      ),
+    );
+  }
+}
+
+class _RoleLabel extends StatelessWidget {
+  const _RoleLabel({required this.label, required this.active});
+
+  final String label;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: MeshSpace.md,
+        vertical: MeshSpace.sm,
+      ),
+      decoration: BoxDecoration(
+        color: active ? MeshSurface.control : Colors.transparent,
+        borderRadius: BorderRadius.circular(MeshRadius.sm - 2),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 13,
+          fontWeight: FontWeight.w600,
+          color:
+              active ? MeshNeutral.textPrimary : MeshNeutral.textSecondary,
+        ),
+      ),
+    );
+  }
+}
+
+/// Center-stage content per call state. Pure presentation over [_state] —
+/// no signaling, no new states.
+class _StateBody extends StatelessWidget {
+  const _StateBody({
+    required this.state,
+    required this.isCaller,
+    required this.remoteName,
+    required this.hasAudio,
+    required this.formattedDuration,
+    required this.isMicMuted,
+    required this.audioRoute,
+    required this.onToggleMic,
+    required this.onToggleRoute,
+    required this.onRetry,
+    required this.onBack,
+  });
+
+  final SignalingState state;
+  final bool isCaller;
+  final String remoteName;
+  final bool hasAudio;
+  final String formattedDuration;
+  final bool isMicMuted;
+  final AudioRoute audioRoute;
+  final VoidCallback onToggleMic;
+  final VoidCallback onToggleRoute;
+  final VoidCallback onRetry;
+  final VoidCallback onBack;
+
+  String get _eyebrow => isCaller ? 'Outgoing intercom' : 'Callee intercom';
+
+  @override
+  Widget build(BuildContext context) {
+    return switch (state) {
+      SignalingState.connected => Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(_eyebrow, style: MeshText.eyebrow),
+            const SizedBox(height: MeshSpace.sm),
+            Text(remoteName, style: MeshText.pageTitle),
+            const SizedBox(height: MeshSpace.sm),
+            Text(
+              formattedDuration,
+              style: MeshText.timer(),
+            ),
+            if (hasAudio) ...[
+              const SizedBox(height: MeshSpace.xs),
+              const Text('Audio connected', style: MeshText.metadata),
+            ],
+            const SizedBox(height: MeshSpace.xl),
+            _AudioRouteCard(
+              route: audioRoute,
+              interactive: isCaller,
+              onTap: onToggleRoute,
+            ),
+            const SizedBox(height: MeshSpace.sm),
+            _MicRow(muted: isMicMuted, onTap: onToggleMic),
+          ],
+        ),
+      SignalingState.connecting when isCaller => Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(_eyebrow, style: MeshText.eyebrow),
+            const SizedBox(height: MeshSpace.sm),
+            const Text('Calling Callee', style: MeshText.pageTitle),
+            const SizedBox(height: MeshSpace.sm),
+            const Text(
+              'Establishing connection…',
+              style: MeshText.supporting,
+            ),
+            const SizedBox(height: MeshSpace.xl),
+            const SizedBox(
+              width: 120,
+              child: LinearProgressIndicator(
+                minHeight: 2,
+                backgroundColor: MeshSurface.surfaceElevated,
+                valueColor:
+                    AlwaysStoppedAnimation<Color>(MeshLive.connected),
+              ),
+            ),
+          ],
+        ),
+      SignalingState.connecting => Column(
+          // Callee standby: waiting for (and auto-answering) offers.
+          // `connecting` covers both waiting and answering — one honest
+          // treatment, no Decline, no invented incoming state.
+          mainAxisSize: MainAxisSize.min,
+          children: const [
+            Icon(
+              Icons.smartphone_rounded,
+              size: 40,
+              color: MeshNeutral.iconMuted,
+            ),
+            SizedBox(height: MeshSpace.xl),
+            Text(
+              'Callee is ready.',
+              style: MeshText.pageTitle,
+              textAlign: TextAlign.center,
+            ),
+            SizedBox(height: MeshSpace.sm),
+            Text(
+              'Keep this device powered and nearby. '
+              'Incoming calls will answer automatically.',
+              style: MeshText.supporting,
+              textAlign: TextAlign.center,
+            ),
+            SizedBox(height: MeshSpace.xl),
+            _StandbyInfoCard(),
+          ],
+        ),
+      SignalingState.failed => Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              '!',
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w600,
+                color: MeshAlert.dangerText,
+                height: 1,
+              ),
+            ),
+            const SizedBox(height: MeshSpace.md),
+            Text(_eyebrow, style: MeshText.eyebrow),
+            const SizedBox(height: MeshSpace.sm),
+            const Text('Connection failed', style: MeshText.pageTitle),
+            const SizedBox(height: MeshSpace.sm),
+            Text(
+              isCaller
+                  ? 'Could not connect to Callee.'
+                  : 'Could not establish the call.',
+              style: MeshText.supporting,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: MeshSpace.xl),
+            Row(
+              children: [
+                Expanded(
+                  flex: 3,
+                  child: FilledButton(
+                    style: MeshControls.primaryAction(),
+                    onPressed: onRetry,
+                    child: const Text('Try again'),
+                  ),
+                ),
+                const SizedBox(width: MeshSpace.md),
+                Expanded(
+                  flex: 2,
+                  child: FilledButton(
+                    style: MeshControls.secondary(),
+                    // Same path as hangup: service cleanup, then pop.
+                    onPressed: onBack,
+                    child: const Text('Back'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      SignalingState.disconnected => Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(_eyebrow, style: MeshText.eyebrow),
+            const SizedBox(height: MeshSpace.sm),
+            const Text('Connection lost', style: MeshText.pageTitle),
+            const SizedBox(height: MeshSpace.sm),
+            const Text(
+              'The call was interrupted.',
+              style: MeshText.supporting,
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      SignalingState.idle => const Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('Preparing…', style: MeshText.pageTitle),
+          ],
+        ),
+    };
+  }
+}
+
+/// Static standby facts. Only claims what the existing flow guarantees:
+/// speaker forced on after handshake, auto-answer always on.
+class _StandbyInfoCard extends StatelessWidget {
+  const _StandbyInfoCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(MeshSpace.lg),
+      decoration: BoxDecoration(
+        color: MeshSurface.surfaceElevated,
+        borderRadius: BorderRadius.circular(MeshRadius.md),
+      ),
+      child: const Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('Ready to receive calls', style: MeshText.section),
+          SizedBox(height: MeshSpace.xs),
+          Text(
+            'Speaker on · Auto-answer on',
+            style: MeshText.metadata,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Audio-output row. Tappable for the Caller (existing toggle); static
+/// for the Callee (route fixed to speaker by the existing flow).
+class _AudioRouteCard extends StatelessWidget {
+  const _AudioRouteCard({
+    required this.route,
+    required this.interactive,
+    required this.onTap,
+  });
+
+  final AudioRoute route;
+  final bool interactive;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final (icon, label) = switch (route) {
+      AudioRoute.speaker => (Icons.volume_up_rounded, 'Speaker'),
+      AudioRoute.earpiece => (Icons.phone_in_talk_rounded, 'Earpiece'),
+      AudioRoute.headset => (Icons.headset_rounded, 'Headset'),
+    };
+    final row = Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: MeshSpace.lg,
+        vertical: MeshSpace.md,
+      ),
+      decoration: BoxDecoration(
+        color: MeshSurface.surfaceElevated,
+        borderRadius: BorderRadius.circular(MeshRadius.md),
+      ),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.speaker_rounded,
+            size: 22,
+            color: MeshNeutral.iconMuted,
+          ),
+          const SizedBox(width: MeshSpace.md),
+          const Expanded(
+            child: Text('Audio route', style: MeshText.metadata),
+          ),
+          Icon(icon, size: 18, color: MeshNeutral.icon),
+          const SizedBox(width: MeshSpace.xs),
+          Text(label, style: MeshText.section.copyWith(fontSize: 13)),
+          if (interactive) ...[
+            const SizedBox(width: MeshSpace.xs),
+            const Icon(
+              Icons.chevron_right_rounded,
+              size: 20,
+              color: MeshNeutral.iconMuted,
+            ),
+          ],
+        ],
+      ),
+    );
+    if (!interactive) return row;
+    return InkWell(
+      borderRadius: BorderRadius.circular(MeshRadius.md),
+      onTap: onTap,
+      child: row,
+    );
+  }
+}
+
+/// Microphone state with a full 48px tap target. Toggles the existing
+/// mute — no new mute system.
+class _MicRow extends StatelessWidget {
+  const _MicRow({required this.muted, required this.onTap});
+
+  final bool muted;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(MeshRadius.sm),
+      onTap: onTap,
+      child: SizedBox(
+        height: MeshSize.iconButton,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              muted ? Icons.mic_off_rounded : Icons.mic_rounded,
+              size: 20,
+              color:
+                  muted ? MeshAlert.dangerText : MeshNeutral.iconMuted,
+            ),
+            const SizedBox(width: MeshSpace.sm),
+            Text(
+              muted ? 'Microphone off' : 'Microphone on',
+              style: MeshText.metadata.copyWith(
+                color: muted
+                    ? MeshAlert.dangerText
+                    : MeshNeutral.textSecondary,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Caller-only announcement composer (solid treatment). Same send flow,
+/// same length cap, same confirmations.
+class _AnnouncementComposer extends StatelessWidget {
+  const _AnnouncementComposer({
+    required this.controller,
+    required this.sending,
+    required this.onChanged,
+    required this.onSend,
+  });
+
+  final TextEditingController controller;
+  final bool sending;
+  final ValueChanged<String> onChanged;
+  final VoidCallback onSend;
+
+  @override
+  Widget build(BuildContext context) {
+    final canSend = controller.text.trim().isNotEmpty && !sending;
+    return ConstrainedBox(
+      constraints:
+          const BoxConstraints(maxWidth: MeshSize.maxContentWidth),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(
+            MeshSpace.lg, MeshSpace.xs, MeshSpace.xs, MeshSpace.xs),
+        decoration: BoxDecoration(
+          color: MeshSurface.surfaceElevated,
+          borderRadius: BorderRadius.circular(MeshRadius.md),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: controller,
+                minLines: 1,
+                maxLines: 3,
+                maxLength: SignalingService.maxAnnouncementLength,
+                textInputAction: TextInputAction.send,
+                onChanged: onChanged,
+                onSubmitted: (_) => onSend(),
+                cursorColor: MeshLive.connected,
+                style: MeshText.body,
+                decoration: const InputDecoration(
+                  isDense: true,
+                  border: InputBorder.none,
+                  counterText: '',
+                  hintText: 'Announce to callee…',
+                  hintStyle: MeshText.supporting,
                 ),
               ),
             ),
-          ),
-        ],
+            const SizedBox(width: MeshSpace.xs),
+            SizedBox(
+              width: MeshSize.iconButton,
+              height: MeshSize.iconButton,
+              child: IconButton(
+                tooltip: 'Send announcement',
+                onPressed: canSend ? onSend : null,
+                icon: Icon(
+                  Icons.campaign_rounded,
+                  size: 22,
+                  color: canSend
+                      ? MeshBrand.primaryAction
+                      : MeshNeutral.textFaint,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Bottom action area per state. Hangup path untouched: [_hangup] locks,
+/// cleans up in background, pops.
+class _BottomControls extends StatelessWidget {
+  const _BottomControls({
+    required this.state,
+    required this.isCaller,
+    required this.isEnding,
+    required this.onHangup,
+    required this.onRetry,
+  });
+
+  final SignalingState state;
+  final bool isCaller;
+  final bool isEnding;
+  final VoidCallback onHangup;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    // Failed already offers Try again + Back (Back == hangup path).
+    if (state == SignalingState.failed) return const SizedBox.shrink();
+    final label = switch (state) {
+      SignalingState.connected => 'End call',
+      SignalingState.connecting =>
+        isCaller ? 'End call' : 'Leave standby',
+      SignalingState.disconnected => 'End call',
+      SignalingState.idle => 'End call',
+      SignalingState.failed => 'End call',
+    };
+    return SizedBox(
+      width: double.infinity,
+      child: FilledButton(
+        style: MeshControls.danger(),
+        // Locked instantly once tapped — see _hangup().
+        onPressed: isEnding ? null : onHangup,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.call_end_rounded,
+              size: 22,
+              color: Colors.white,
+            ),
+            const SizedBox(width: MeshSpace.sm),
+            Text(label, style: MeshText.action),
+          ],
+        ),
       ),
     );
   }
