@@ -89,37 +89,28 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Lets the Caller broadcast a spoken announcement to the Callee WITHOUT
   /// starting a call. Just an RTDB write + Worker standby-wake (see
   /// [publishAnnouncement]) — no mic permission, no WebRTC, no CallScreen.
+  ///
+  /// Presentation is a compact bottom sheet ([_AnnouncementSheet]); the
+  /// flow around it is unchanged: dismiss first, then trim, then publish,
+  /// then confirm. Scrim-tap/drag dismiss counts as cancel, exactly like
+  /// tapping outside the old dialog.
   Future<void> _promptAnnouncement() async {
-    final controller = TextEditingController();
-    final text = await showDialog<String>(
+    final text = await showModalBottomSheet<String>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Announcement'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: SignalingService.maxAnnouncementLength,
-          minLines: 1,
-          maxLines: 3,
-          textInputAction: TextInputAction.send,
-          decoration: const InputDecoration(
-            hintText: 'e.g. Dinner is ready',
-          ),
-          onSubmitted: (value) => Navigator.of(dialogContext).pop(value),
+      isScrollControlled: true,
+      backgroundColor: MeshSurface.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(
+          top: Radius.circular(MeshRadius.sheet),
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(controller.text),
-            child: const Text('Send'),
-          ),
-        ],
+      ),
+      showDragHandle: true,
+      builder: (sheetContext) => Padding(
+        padding:
+            EdgeInsets.only(bottom: MediaQuery.of(sheetContext).viewInsets.bottom),
+        child: const _AnnouncementSheet(),
       ),
     );
-    controller.dispose();
     final trimmed = text?.trim() ?? '';
     if (trimmed.isEmpty || !mounted) return;
     final messenger = ScaffoldMessenger.of(context);
@@ -503,6 +494,126 @@ class _AnnouncementRow extends StatelessWidget {
               Icons.chevron_right_rounded,
               size: 20,
               color: MeshNeutral.iconMuted,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Compact bottom-sheet composer for a Home announcement.
+///
+/// Returns the raw field text via `Navigator.pop` (Send action or keyboard
+/// send); scrim-tap/drag returns null (cancel). Trimming, empty
+/// validation, publishing and confirmation all stay with the caller —
+/// this widget only collects text under the same contract the old dialog
+/// had: autofocus, `maxLength: 200`, send submits.
+///
+/// The Send action is disabled while the field is empty, and a purely
+/// UI-level submit guard blocks a second tap during the exit animation
+/// from popping the route underneath. Neither changes the publish flow.
+class _AnnouncementSheet extends StatefulWidget {
+  const _AnnouncementSheet();
+
+  @override
+  State<_AnnouncementSheet> createState() => _AnnouncementSheetState();
+}
+
+class _AnnouncementSheetState extends State<_AnnouncementSheet> {
+  late final TextEditingController _controller = TextEditingController();
+  bool _submitting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.addListener(_onTextChanged);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onTextChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _submit() {
+    if (_submitting) return;
+    _submitting = true;
+    Navigator.of(context).pop(_controller.text);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = _controller.text;
+    final canSend = text.trim().isNotEmpty;
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(
+          MeshSize.screenMargin,
+          MeshSpace.sm,
+          MeshSize.screenMargin,
+          MeshSpace.xl,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Announcement', style: MeshText.section),
+            const SizedBox(height: MeshSpace.xs),
+            const Text(
+              'Send a voice message to Callee.',
+              style: MeshText.supporting,
+            ),
+            const SizedBox(height: MeshSpace.md),
+            Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: MeshSpace.lg,
+                vertical: MeshSpace.sm,
+              ),
+              decoration: BoxDecoration(
+                color: MeshSurface.surfaceElevated,
+                borderRadius: BorderRadius.circular(MeshRadius.md),
+              ),
+              child: TextField(
+                controller: _controller,
+                autofocus: true,
+                maxLength: SignalingService.maxAnnouncementLength,
+                minLines: 3,
+                maxLines: 5,
+                textInputAction: TextInputAction.send,
+                onSubmitted: (_) => _submit(),
+                cursorColor: MeshLive.connected,
+                style: MeshText.body,
+                decoration: const InputDecoration(
+                  isDense: true,
+                  border: InputBorder.none,
+                  counterText: '',
+                  hintText: 'Tulis pengumuman...',
+                  hintStyle: MeshText.supporting,
+                ),
+              ),
+            ),
+            const SizedBox(height: MeshSpace.xs),
+            Align(
+              alignment: Alignment.centerRight,
+              child: Text(
+                '${text.characters.length} / ${SignalingService.maxAnnouncementLength}',
+                style: MeshText.metadata,
+              ),
+            ),
+            const SizedBox(height: MeshSpace.md),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                style: MeshControls.primaryAction(),
+                onPressed: canSend ? _submit : null,
+                child: const Text('Umumkan'),
+              ),
             ),
           ],
         ),

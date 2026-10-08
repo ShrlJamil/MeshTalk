@@ -205,8 +205,9 @@ class MeshSpace {
   static const double xxl = 32;
 }
 
-/// Restrained radii. `pill` is reserved for the status pill only — buttons
-/// and cards use sm/md (see Figma: CTA and cards are ~10-14px, not capsules).
+/// Restrained radii. Rectangular controls use sm/md (see Figma: CTA and
+/// cards are ~10-14px, not capsules). `pill` remains only for fully
+/// circular icon affordances — never for bars, controls or cards.
 class MeshRadius {
   const MeshRadius._();
 

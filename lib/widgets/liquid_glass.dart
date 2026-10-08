@@ -414,7 +414,7 @@ class DynamicLivePill extends StatelessWidget {
                   const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
               decoration: BoxDecoration(
                 color: MeshSurface.surface,
-                borderRadius: BorderRadius.circular(MeshRadius.pill),
+                borderRadius: BorderRadius.circular(MeshRadius.md),
                 border: Border.all(color: MeshNeutral.border),
               ),
               child: AnimatedSwitcher(
